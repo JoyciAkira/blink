@@ -78,10 +78,14 @@ void *mmap(void *addr, size_t length, int prot, int flags, int fd, long offset) 
     len = bw_round_up(len, page);
     if (len < page) len = page;
 
-    /* Header tracking: salviamo il raw pointer malloc prima dell'area allineata.
-     * Allochiamo: [8 byte raw_ptr] [padding] [area allineata di len bytes] */
-    size_t hdr  = sizeof(void *);
-    size_t need = hdr + len + page;
+    /* ALIGNMENT_OVERHEAD_ONLY (M114): allocate exactly `len` (already a page
+     * multiple) with aligned_alloc, which guarantees page alignment and returns
+     * a directly free()-able pointer. This removes the previous per-mapping
+     * alignment slack: the old scheme did malloc(hdr + len + page) + manual
+     * forward-alignment + an 8-byte raw-pointer header, wasting ~1 extra wasm
+     * page (64KB) + header on EVERY mmap. `len` and the zero-init semantics are
+     * unchanged (mmap still returns whole page-rounded regions). */
+    size_t need = len;
 
     /* --- M114-B2-P probe accounting (before malloc so failures are counted) --- */
     bw_shim_mmap_count++;
@@ -106,16 +110,8 @@ void *mmap(void *addr, size_t length, int prot, int flags, int fd, long offset) 
         if (pn > 0) { ssize_t w = write(2, p, (size_t)pn); (void)w; }
     }
 
-    void  *raw  = malloc(need);
-    if (!raw) { bw_shim_malloc_fail_count++; errno = ENOMEM; return MAP_FAILED; }
-
-    /* Allinea in avanti di page, con spazio per l'header */
-    uintptr_t raw_start = (uintptr_t)raw + hdr;
-    uintptr_t aligned   = (raw_start + page - 1) & ~(page - 1);
-    void     *data      = (void *)aligned;
-
-    /* Salva raw pointer nell'header (subito prima dell'area allineata) */
-    ((void **)data)[-1] = raw;
+    void *data = aligned_alloc(page, need);
+    if (!data) { bw_shim_malloc_fail_count++; errno = ENOMEM; return MAP_FAILED; }
 
     /* Zero-init */
     memset(data, 0, len);
@@ -150,9 +146,8 @@ void *mmap(void *addr, size_t length, int prot, int flags, int fd, long offset) 
 int munmap(void *addr, size_t length) {
     (void)length;
     if (!addr) return 0;
-    /* raw pointer e' salvato subito prima dell'area allineata */
-    void *raw = ((void **)addr)[-1];
-    free(raw);
+    /* aligned_alloc returns a directly free()-able pointer (no header now) */
+    free(addr);
     return 0;
 }
 
