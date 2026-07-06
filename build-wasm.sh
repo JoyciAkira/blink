@@ -69,7 +69,7 @@ clang --target=wasm32 \
     -Wl,--export=_start \
     -Wl,--export=__indirect_function_table \
     -Wl,--shared-memory \
-    -Wl,--initial-memory=458752 \
+    -Wl,--initial-memory=2097152 \
     -Wl,--max-memory=4294967296 \
     -Wl,--import-memory \
     -Wl,--gc-sections \
