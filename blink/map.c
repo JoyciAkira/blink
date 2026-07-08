@@ -37,9 +37,14 @@
 #include "blink/vfs.h"
 
 static long GetSystemPageSize(void) {
-#ifdef __EMSCRIPTEN__
-  // "pages" in Emscripten only refer to the granularity the memory
-  // buffer can be grown at but does not affect functions like mmap
+#if defined(__EMSCRIPTEN__) || defined(__wasm32__)
+  // On Emscripten and bare wasm32 (--target=wasm32 with musl), sysconf()
+  // returns 65536 (one WebAssembly memory page), but blink's guest-page
+  // granularity is 4096.  Using 65536 here makes FreePage round every
+  // host pointer DOWN to a 64KB boundary before Munmap, which forces the
+  // mmap shim to return 64KB-aligned pointers.  With a sub-page shim that
+  // sub-allocates 4KB slots inside 64KB wasm slabs we return 4KB-aligned
+  // pointers, so FreePage must use 4096 as its round-down stride.
   return 4096;
 #else
   long z;
