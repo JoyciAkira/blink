@@ -35,6 +35,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/file.h>
+#include <sys/eventfd.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/param.h>
@@ -371,6 +372,7 @@ _Noreturn void SysExitGroup(struct Machine *m, int rc) {
       m->system->exitcode = rc;
       HaltMachine(m, kMachineExitTrap);
     }
+#ifndef __wasm__
     FreeMachine(m);
 #ifdef HAVE_JIT
     ShutdownJit();
@@ -381,6 +383,12 @@ _Noreturn void SysExitGroup(struct Machine *m, int rc) {
     }
 #endif
     exit(rc);
+#else
+    /* On wasm, FreeMachine before exit can segfault if guest threads
+       are still scheduled. The wasm runtime reclaims all memory on
+       module return, so skip explicit cleanup and _Exit immediately. */
+    _Exit(rc);
+#endif
   }
 }
 
@@ -1084,6 +1092,17 @@ static int SysMprotect(struct Machine *m, i64 addr, u64 size, int prot) {
   return rc;
 }
 
+static int SysMembarrier(struct Machine *m, int cmd, int flags, int cpu_id) {
+  const int supported = 0x01 | 0x02 | 0x04 | 0x08 | 0x10 | 0x20 | 0x40;
+  (void)m;
+  (void)cpu_id;
+  if (flags) return einval();
+  if (!cmd) return supported;
+  if (cmd & ~supported) return einval();
+  atomic_thread_fence(memory_order_seq_cst);
+  return 0;
+}
+
 static int SysMadvise(struct Machine *m, i64 addr, u64 len, int advice) {
   return 0;
 }
@@ -1257,11 +1276,48 @@ static i64 SysMmap(struct Machine *m, i64 virt, u64 size, int prot, int flags,
 
 static i64 SysMremap(struct Machine *m, i64 old_address, u64 old_size,
                      u64 new_size, int flags, i64 new_address) {
-  // would be nice to have
-  // avoid being noisy in the logs
-  // hope program has fallback for failure
-  LOG_ONCE(MEM_LOGF("mremap() not supported yet"));
-  return enomem();
+  i64 result;
+  u64 entry, key;
+  if (flags || new_address || (old_address & 4095) || !old_size || !new_size) {
+    return einval();
+  }
+  old_size = ROUNDUP(old_size, 4096);
+  new_size = ROUNDUP(new_size, 4096);
+  if (old_size == new_size) return old_address;
+  BEGIN_NO_PAGE_FAULTS;
+  LOCK(&m->system->mmap_lock);
+  result = enomem();
+  if (!IsFullyMapped(m->system, old_address, old_size)) {
+    result = efault();
+    goto Finished;
+  }
+  if (new_size < old_size) {
+    if (!FreeVirtual(m->system, old_address + new_size, old_size - new_size)) {
+      result = old_address;
+    }
+    goto Finished;
+  }
+  if (!IsFullyUnmapped(m->system, old_address + old_size,
+                       new_size - old_size)) {
+    goto Finished;
+  }
+  if (!(entry = FindPageTableEntry(m, old_address))) {
+    result = efault();
+    goto Finished;
+  }
+  if (entry & PAGE_FILE) {
+    goto Finished;
+  }
+  key = Prot2Page(GetProtection(entry));
+  if (ReserveVirtual(m->system, old_address + old_size, new_size - old_size,
+                     key, -1, 0, false, false) != -1) {
+    result = old_address;
+  }
+Finished:
+  unassert(CheckMemoryInvariants(m->system));
+  UNLOCK(&m->system->mmap_lock);
+  END_NO_PAGE_FAULTS;
+  return result;
 }
 
 static int XlatMsyncFlags(int flags) {
@@ -5304,6 +5360,39 @@ static i32 SysEpollCreate1(struct Machine *m, i32 flags) {
   return fildes;
 }
 
+static i32 SysEventfd2(struct Machine *m, u32 initval, i32 flags) {
+  int fildes, lim, oflags, sysflags;
+  oflags = O_RDWR;
+  sysflags = 0;
+  if (flags & EFD_SEMAPHORE_LINUX) {
+    sysflags |= EFD_SEMAPHORE;
+    flags &= ~EFD_SEMAPHORE_LINUX;
+  }
+  if (flags & EFD_CLOEXEC_LINUX) {
+    oflags |= O_CLOEXEC;
+    sysflags |= EFD_CLOEXEC;
+    flags &= ~EFD_CLOEXEC_LINUX;
+  }
+  if (flags & EFD_NONBLOCK_LINUX) {
+    oflags |= O_NDELAY;
+    sysflags |= EFD_NONBLOCK;
+    flags &= ~EFD_NONBLOCK_LINUX;
+  }
+  if (flags) return einval();
+  if (!(lim = GetFileDescriptorLimit(m->system))) return emfile();
+  if ((fildes = eventfd(initval, sysflags)) != -1) {
+    if (fildes >= lim) {
+      close(fildes);
+      fildes = emfile();
+    } else {
+      LOCK(&m->system->fds.lock);
+      unassert(AddFd(&m->system->fds, fildes, oflags));
+      UNLOCK(&m->system->fds.lock);
+    }
+  }
+  return fildes;
+}
+
 static i32 SysEpollCreate(struct Machine *m, i32 size) {
   if (size <= 0) return einval();
   return SysEpollCreate1(m, 0);
@@ -5682,12 +5771,14 @@ void OpSyscall(P) {
     SYSCALL(5, 0x10F, "ppoll", SysPpoll, STRACE_5);
     SYSCALL(5, 0x13C, "renameat2", SysRenameat2, STRACE_RENAMEAT2);
     SYSCALL(3, 0x13E, "getrandom", SysGetrandom, STRACE_GETRANDOM);
+    SYSCALL(3, 0x144, "membarrier", SysMembarrier, STRACE_3);
     SYSCALL(5, 0x147, "preadv2", SysPreadv2, STRACE_PREADV2);
     SYSCALL(5, 0x148, "pwritev2", SysPwritev2, STRACE_PWRITEV2);
     SYSCALL(3, 0x1B4, "close_range", SysCloseRange, STRACE_3);
 #ifdef HAVE_EPOLL_PWAIT1
     SYSCALL(1, 0x0D5, "epoll_create", SysEpollCreate, STRACE_1);
     SYSCALL(1, 0x123, "epoll_create1", SysEpollCreate1, STRACE_1);
+    SYSCALL(2, 0x122, "eventfd2", SysEventfd2, STRACE_2);
     SYSCALL(4, 0x0E9, "epoll_ctl", SysEpollCtl, STRACE_4);
     SYSCALL(4, 0x0E8, "epoll_wait", SysEpollWait, STRACE_4);
     SYSCALL(6, 0x119, "epoll_pwait", SysEpollPwait, STRACE_6);

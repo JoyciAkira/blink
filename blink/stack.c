@@ -194,6 +194,7 @@ static u64 LoadAddressFromMemory(P) {
 }
 
 void OpCallEq(P) {
+  u64 func;
   if (IsMakingPath(m) && HasLinearMapping() && !Osz(rde)) {
     Jitter(A,
            "z3B"    // res0 = GetRegOrMem[force64bit](RexbRm)
@@ -202,7 +203,8 @@ void OpCallEq(P) {
            "m",     // call micro-op (FastCallAbs)
            FastCallAbs);
   }
-  OpCall(A, LoadAddressFromMemory(A));
+  func = LoadAddressFromMemory(A);
+  OpCall(A, func);
 }
 
 void OpJmpEq(P) {
@@ -307,5 +309,6 @@ void OpPushEvq(P) {
 
 void OpPopEvq(P) {
   unsigned osz = kStackOsz[Osz(rde)][Mode(rde)];
-  WriteMemWord(GetModrmRegisterWordPointerWrite(A, osz), rde, osz, Pop(A, 0));
+  u64 value = Pop(A, 0);
+  WriteMemWord(GetModrmRegisterWordPointerWrite(A, osz), rde, osz, value);
 }
