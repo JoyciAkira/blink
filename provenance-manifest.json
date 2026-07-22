@@ -1,0 +1,88 @@
+{
+  "schema": "blink-node-sigsegv-diagnosis/v1",
+  "generated": "2026-07-21",
+  "purpose": "Immutable provenance freeze before 20-run SIGSEGV reproduction",
+
+  "blink_source": {
+    "repo": "https://github.com/JoyciAkira/blink.git",
+    "branch": "diagnostics/node-v8-sigsegv-classification",
+    "commit": "12bae9fc2e411a07bea2a8494014628d6da0890f",
+    "commit_subject": "build(wasm): rebuild with HAVE_EPOLL_PWAIT1 + X87 + BMI2 enabled",
+    "worktree": "/Users/danielecorrao/tombl-build/blink-node-sigsegv-diagnosis",
+    "working_tree_clean": true
+  },
+
+  "linux_source": {
+    "repo": "https://github.com/JoyciAkira/linux.git",
+    "commit": "839f8416f6749839d7988506d979fadf6dcf0142",
+    "commit_subject": "wasm: add transparent virtio-net host device",
+    "worktree": "/Users/danielecorrao/tombl-build/linux"
+  },
+
+  "artifacts": {
+    "blink_wasm_committed": {
+      "path": "blink-fixed.wasm",
+      "abs_path": "/Users/danielecorrao/tombl-build/blink-node-sigsegv-diagnosis/blink-fixed.wasm",
+      "sha256": "48fc1aa7c39fa045e7bf815b117bf9c582567d05ecd75874c0fb28378e705a60",
+      "bytes": 451659,
+      "note": "blink at commit 12bae9f — NOT the binary inside rootfs-diag.ext2"
+    },
+    "blink_wasm_in_rootfs_stage": {
+      "path": "rootfs-stage/bin/blink",
+      "abs_path": "/Users/danielecorrao/tombl-build/rootfs-stage/bin/blink",
+      "sha256": "799a96b8bf239c94fd055eebc41412e5615892b9a99d1868c44ec58bfe9be0a4",
+      "bytes": 389155,
+      "note": "WASM binary actually embedded in rootfs-diag.ext2; older than 12bae9f (close to eff8166 390681 but not identical); this is the blink that executed in all 23 historical runs"
+    },
+    "vmlinux_wasm": {
+      "path": "linux/tools/wasm/vmlinux.wasm",
+      "abs_path": "/Users/danielecorrao/tombl-build/linux/tools/wasm/vmlinux.wasm",
+      "sha256": "dda68dcde9e6f978db7e18fdf596fb646371c2b0957c0b9580f953fdfe5a9ee9",
+      "bytes_approx": "5.6M",
+      "kernel_banner": "Linux version 6.1.132+ (root@0e38d759a80b)",
+      "rebuild_cmd": "llvm-objcopy --add-section=.linux.sections=arch/wasm/sections.json --add-section=.linux.initramfs=usr/initramfs_inc_data vmlinux.o tools/wasm/vmlinux.wasm",
+      "note": "Rebuilt from vmlinux.o (gitignored). Banner matches all 23 historical run logs exactly."
+    },
+    "rootfs_diag_ext2": {
+      "path": "linux/tools/wasm/rootfs-diag.ext2",
+      "abs_path": "/Users/danielecorrao/tombl-build/linux/tools/wasm/rootfs-diag.ext2",
+      "sha256": "6632596843381d681197ac99dd3b1768b3c714a21170e249f50c7d3f0232364e",
+      "bytes": 268435456,
+      "note": "Filesystem used by harness (fetched as ./rootfs-diag.ext2 relative to HTML). Contains /bin/blink = 799a96b8."
+    },
+    "node_binary_in_rootfs": {
+      "path": "rootfs-stage/bin/node",
+      "abs_path": "/Users/danielecorrao/tombl-build/rootfs-stage/bin/node",
+      "sha256": "07b6c68d5f8bab02b775f8a81ab709d445829d37b36c1f72911d9e79b3961ea0",
+      "format": "ELF 64-bit x86-64 dynamically linked musl",
+      "note": "Node v20.18.0 — the guest x86-64 binary executed inside blink"
+    },
+    "harness_html": {
+      "path": "linux/tools/wasm/node-eval-diag-probe.html",
+      "note": "Boots kernel, runs /bin/blink /bin/node -e '...' inside guest shell"
+    },
+    "dist_index_js": {
+      "path": "linux/tools/wasm/dist/index.js",
+      "note": "Compiled TypeScript runtime. Fetches ../vmlinux.wasm relative to its URL."
+    }
+  },
+
+  "execution_chain": "Chromium -> dist/index.js -> vmlinux.wasm (Linux 6.1.132+) -> /bin/sh -> /bin/blink (WASM) -> /bin/node (x86-64 ELF via blink x86 emulator)",
+
+  "historical_crash_evidence": {
+    "runs_count": 23,
+    "all_used_kernel_banner": "Linux version 6.1.132+ (root@0e38d759a80b)",
+    "run1_mode": "SIGILL: rip=faultaddr (instruction fetch failure), exit=139",
+    "run18_mode": "SIGSEGV si_code=2 at 0x379b81a99801 (SEGV_ACCERR in V8 cage mprotect RW region), exit=null/timeout",
+    "run18_sequence": "mmap(0x379b81a80000, 0x7f000, PROT_NONE) -> madvise DONTDUMP -> munmap(0x379b81ac0000) -> mprotect(0x379b81a80000, 0x40000, RW) -> [later] SIGSEGV at 0x379b81a99801",
+    "observation": "Two distinct crash modes. SEGV_ACCERR (si_code=2) at address inside mprotect'd RW region = candidate for mprotect semantics bug or guest/host translation error, not necessarily PT-walk race."
+  },
+
+  "hypotheses_to_distinguish": [
+    "H1: V8 guard-page fault valid but guest signal delivery broken",
+    "H2: Blink mprotect semantics wrong (returns success but page remains NONE)",
+    "H3: Guest-to-host address translation returns wrong page or permissions",
+    "H4: Concurrent PT-walk observes freed/stale state (race/lifetime bug)",
+    "H5: Inconclusive from available evidence"
+  ]
+}
