@@ -4,11 +4,11 @@
 
 set -euo pipefail
 
-BLINK_SRC="$HOME/tombl-build/blink"
+BLINK_SRC="$HOME/tombl-build/blink-node-sigsegv-diagnosis"
 MUSL="$HOME/tombl-build/musl-install/usr/local/musl"
 COMPILER_RT="$HOME/tombl-build/compiler-rt-wasm/libcompiler_rt_wasm.a"
 OUTDIR="/tmp/blink-wasm-build"
-OUTPUT="$BLINK_SRC/blink-fixed.wasm"
+OUTPUT="$BLINK_SRC/blink-probe.wasm"
 
 # Clean and create build dir
 rm -rf "$OUTDIR"

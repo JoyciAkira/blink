@@ -277,6 +277,14 @@ u8 *LookupAddress2(struct Machine *m, i64 virt, u64 mask, u64 need) {
     return (u8 *)efault0();
   }
   if ((entry & mask) != need) {
+    SYS_LOGF("SEGV_ACCERR virt=%#" PRIx64 " entry=%#" PRIx64
+             " mask=%#" PRIx64 " need=%#" PRIx64
+             " (U=%d RW=%d XD=%d RSRV=%d V=%d HOST=%d MAP=%d MUG=%d)",
+             virt, entry, mask, need,
+             !!(entry & PAGE_U), !!(entry & PAGE_RW), !!(entry & PAGE_XD),
+             !!(entry & PAGE_RSRV), !!(entry & PAGE_V),
+             !!(entry & PAGE_HOST), !!(entry & PAGE_MAP),
+             !!(entry & PAGE_MUG));
     m->segvcode = SEGV_ACCERR_LINUX;
     return (u8 *)efault0();
   }
