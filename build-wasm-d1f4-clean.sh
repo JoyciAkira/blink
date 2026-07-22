@@ -22,6 +22,8 @@ CFLAGS="$CFLAGS -include $BLINK_SRC/blink-mman-shim.h"
 CFLAGS="$CFLAGS -Wno-macro-redefined -Wno-unused-command-line-argument"
 
 cd "$BLINK_SRC"
+CC=clang CFLAGS="--target=wasm32 -matomics -mbulk-memory -O2" ./configure --disable-jit >/dev/null
+perl -0pi -e 's/^#define DISABLE_THREADS$/\/\/ #define DISABLE_THREADS/m; s!^// #define HAVE_EPOLL_PWAIT1$!#define HAVE_EPOLL_PWAIT1!m' config.h
 
 echo "=== Compiling blink source files ==="
 SRC_FILES=()
