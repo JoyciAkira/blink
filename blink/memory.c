@@ -17,6 +17,7 @@
 │ PERFORMANCE OF THIS SOFTWARE.                                                │
 ╚─────────────────────────────────────────────────────────────────────────────*/
 #include <errno.h>
+#include <inttypes.h>
 #include <stddef.h>
 #include <stdlib.h>
 #include <string.h>
@@ -277,6 +278,10 @@ u8 *LookupAddress2(struct Machine *m, i64 virt, u64 mask, u64 need) {
     return (u8 *)efault0();
   }
   if ((entry & mask) != need) {
+    SYS_LOGF("SEGV_ACCERR virt=%#" PRIx64 " entry=%#" PRIx64
+             " mask=%#" PRIx64 " need=%#" PRIx64
+             " rip=%#" PRIx64 " sp=%#" PRIx64,
+             (u64)virt, entry, mask, need, m->ip, m->sp);
     m->segvcode = SEGV_ACCERR_LINUX;
     return (u8 *)efault0();
   }

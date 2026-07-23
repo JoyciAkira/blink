@@ -34,6 +34,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/eventfd.h>
 #include <sys/file.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
@@ -1261,7 +1262,9 @@ static i64 SysMremap(struct Machine *m, i64 old_address, u64 old_size,
   // avoid being noisy in the logs
   // hope program has fallback for failure
   LOG_ONCE(MEM_LOGF("mremap() not supported yet"));
-  return enomem();
+  // Return EINVAL not ENOMEM: V8's stack guard probing expects EINVAL when
+  // in-place expansion isn't possible; ENOMEM triggers an infinite retry loop.
+  return einval();
 }
 
 static int XlatMsyncFlags(int flags) {
@@ -5277,6 +5280,42 @@ static int SysPipe(struct Machine *m, i64 pipefds_addr) {
 
 #ifdef HAVE_EPOLL_PWAIT1
 
+static i32 SysEventfd2(struct Machine *m, u32 initval, i32 flags) {
+  int lim, fildes, oflags, sysflags;
+  oflags = 0;
+  sysflags = 0;
+  if (flags & EFD_CLOEXEC_LINUX) {
+    oflags |= O_CLOEXEC;
+    sysflags |= EFD_CLOEXEC;
+    flags &= ~EFD_CLOEXEC_LINUX;
+  }
+  if (flags & EFD_NONBLOCK_LINUX) {
+    oflags |= O_NDELAY;
+    sysflags |= EFD_NONBLOCK;
+    flags &= ~EFD_NONBLOCK_LINUX;
+  }
+  if (flags & EFD_SEMAPHORE_LINUX) {
+    sysflags |= EFD_SEMAPHORE;
+    flags &= ~EFD_SEMAPHORE_LINUX;
+  }
+  if (flags) {
+    LOGF("unsupported %s flags: %#x", "eventfd2", flags);
+    return einval();
+  }
+  if (!(lim = GetFileDescriptorLimit(m->system))) return emfile();
+  if ((fildes = eventfd(initval, sysflags)) != -1) {
+    if (fildes >= lim) {
+      close(fildes);
+      fildes = emfile();
+    } else {
+      LOCK(&m->system->fds.lock);
+      unassert(AddFd(&m->system->fds, fildes, oflags));
+      UNLOCK(&m->system->fds.lock);
+    }
+  }
+  return fildes;
+}
+
 static i32 SysEpollCreate1(struct Machine *m, i32 flags) {
   int lim, fildes, oflags, sysflags;
   oflags = 0;
@@ -5687,6 +5726,7 @@ void OpSyscall(P) {
     SYSCALL(3, 0x1B4, "close_range", SysCloseRange, STRACE_3);
 #ifdef HAVE_EPOLL_PWAIT1
     SYSCALL(1, 0x0D5, "epoll_create", SysEpollCreate, STRACE_1);
+    SYSCALL(2, 0x122, "eventfd2", SysEventfd2, STRACE_2);
     SYSCALL(1, 0x123, "epoll_create1", SysEpollCreate1, STRACE_1);
     SYSCALL(4, 0x0E9, "epoll_ctl", SysEpollCtl, STRACE_4);
     SYSCALL(4, 0x0E8, "epoll_wait", SysEpollWait, STRACE_4);
