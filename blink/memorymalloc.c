@@ -17,6 +17,7 @@
 │ PERFORMANCE OF THIS SOFTWARE.                                                │
 ╚─────────────────────────────────────────────────────────────────────────────*/
 #include <stdlib.h>
+#include <time.h>
 #include <string.h>
 #include <sys/mman.h>
 #include <unistd.h>
@@ -33,6 +34,8 @@
 #include "blink/linux.h"
 #include "blink/log.h"
 #include "blink/machine.h"
+#include "blink/fork-coalesce.h"
+#include "blink/syscall.h"
 #include "blink/macros.h"
 #include "blink/map.h"
 #include "blink/pml4t.h"
@@ -309,6 +312,23 @@ static void FreeMachineUnlocked(struct Machine *m) {
   }
 }
 
+struct Machine *GetMachineByHostThread(struct System *s) {
+  struct Dll *e;
+  struct Machine *m, *found = 0;
+  pthread_t self = pthread_self();
+  if (!s) return 0;
+  LOCK(&s->machines_lock);
+  for (e = dll_first(s->machines); e; e = dll_next(s->machines, e)) {
+    m = MACHINE_CONTAINER(e);
+    if (m->thread && pthread_equal(m->thread, self)) {
+      found = m;
+      break;
+    }
+  }
+  UNLOCK(&s->machines_lock);
+  return found;
+}
+
 bool IsOrphan(struct Machine *m) {
   bool res;
   LOCK(&m->system->machines_lock);
@@ -329,7 +349,22 @@ void KillOtherThreads(struct System *s) {
   struct Dll *e;
   struct Machine *m;
   struct timespec deadline;
+  struct Machine *selfm = GetMachineByHostThread(s);
+  ERRF("G12-KOT-ENTER killer_tid=%d sys_pid=%d selfm_tid=%d self=%p",
+       g_machine ? g_machine->tid : -1, s->pid, selfm ? selfm->tid : -1,
+       (void *)pthread_self());
+#ifdef __wasm__
+  /* N0D: a worker pthread must never KillOtherThreads. wasm _Thread_local
+   * g_machine can alias the leader; identify the caller by pthread_t. */
+  if (selfm && selfm->tid != s->pid) {
+    ERRF("G12-KOT-WORKER-REFUSE tid=%d -> SysExit; wake parent", selfm->tid);
+    fork_coalesce_wake_parent();
+    SysExit(selfm, 0);
+  }
+#endif
   if (atomic_exchange(&s->killer, true)) {
+    ERRF("G12-KOT-ALREADY killer_tid=%d -> pthread_exit",
+         g_machine ? g_machine->tid : -1);
     FreeMachine(g_machine);
     pthread_exit(EXIT_SUCCESS);
   }
@@ -340,12 +375,26 @@ StartOver:
     LOCK(&s->machines_lock);
     for (e = dll_first(s->machines); e; e = dll_next(s->machines, e)) {
       if ((m = MACHINE_CONTAINER(e)) != g_machine) {
+        int eqself = pthread_equal(m->thread, pthread_self());
+        int tgt_leader = (m->tid == s->pid);
+        int killer_worker = (g_machine->tid != s->pid);
         THR_LOGF("pid=%d tid=%d is killing tid %d", s->pid, g_machine->tid,
                  m->tid);
+        ERRF("G12-KOT-KILL killer_tid=%d tgt_tid=%d eqself=%d leader=%d try=%d sig=%s",
+             g_machine->tid, m->tid, eqself, tgt_leader, t,
+             t < 10 ? "SIGSYS" : "SIGKILL");
+        /* N0D C: a CLONE_THREAD worker must not mark/kill the process leader. */
+        if (killer_worker && tgt_leader) {
+          ERRF("G12-KOT-SKIP-LEADER killer_tid=%d tgt_tid=%d", g_machine->tid,
+               m->tid);
+          continue;
+        }
         atomic_store_explicit(&m->killed, true, memory_order_release);
         atomic_store_explicit(&m->attention, true, memory_order_release);
         if (t < 10) {
-          pthread_kill(m->thread, SIGSYS);
+          if (!eqself) pthread_kill(m->thread, SIGSYS);
+        } else if (eqself) {
+          ERRF("G12-KOT-NO-SELF-SIGKILL tgt_tid=%d", m->tid);
         } else {
           LOGF("kill9'd thread after 10 tries");
           pthread_kill(m->thread, SIGKILL);
@@ -422,6 +471,7 @@ struct Machine *NewMachine(struct System *system, struct Machine *parent) {
     ResetInstructionCache(m);
     m->insyscall = false;
     m->nofault = false;
+    atomic_store_explicit(&m->g12_parked, false, memory_order_relaxed);
     m->sysdepth = 0;
     m->sigdepth = 0;
     m->signals = 0;
@@ -639,7 +689,7 @@ static void UnmarkFilePage(struct System *s, i64 virt) {
 }
 
 static void WaitForPageToNotBeLocked(struct System *s, i64 virt, u8 *pte) {
-  unassert(g_machine);
+  if (!g_machine) return;
 #ifdef DEBUG
   unassert(!IsOrphan(g_machine));
   unassert(!HasPageLock(g_machine, virt & -4096));

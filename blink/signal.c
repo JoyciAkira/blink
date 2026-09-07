@@ -18,7 +18,11 @@
 ╚─────────────────────────────────────────────────────────────────────────────*/
 #include "blink/signal.h"
 
+/* T5O */
+extern void SignalfdNotifyOnSignal(int sig);
+
 #include <signal.h>
+#include "blink/fork-coalesce.h"
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -270,12 +274,29 @@ void EnqueueSignal(struct Machine *m, int sig) {
     if ((m->signals & ~m->sigmask)) {
       atomic_store_explicit(&m->attention, true, memory_order_release);
     }
+    /* T5O: wake signalfd objects watching this signal, regardless of the
+     * blocked state — signalfd is the intended consumer for blocked ones. */
+    SignalfdNotifyOnSignal(sig);
   }
 }
 
 void CheckForSignals(struct Machine *m) {
   int sig;
+#ifdef __wasm__
+  if (!g_machine) {
+    ERRF("G12-TLS-WAS-NULL tid=%d ip=%#" PRIx64, m->tid, m->ip);
+  }
+  g_machine = m;
+  if (fork_coalesce_unreaped_child()) {
+    fork_coalesce_check_child(m);
+  }
+  if (fork_coalesce_should_park(m)) {
+    atomic_store_explicit(&m->g12_parked, true, memory_order_release);
+    return;
+  }
+#endif
   if (atomic_load_explicit(&m->killed, memory_order_acquire)) {
+    ERRF("G12-ACTOR-KILLED tid=%d -> SysExit", m->tid);
     SysExit(m, 0);
 #ifndef DISABLE_JIT
   } else if (m->selfmodifying) {

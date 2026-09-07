@@ -22,6 +22,8 @@
 #include <string.h>
 
 #include "blink/assert.h"
+#include "blink/endian.h"
+#include "blink/machine.h"
 
 /* Global process table instance */
 struct GuestProcessTable g_process_table;
@@ -76,6 +78,35 @@ pid_t guest_proc_alloc_pid(void) {
   return 0; /* Exhaustion / collision lock, fail closed */
 }
 
+/* B2 scheduler wiring: run-queue append/remove + quantum init. */
+#define GUEST_QUANTUM_INSTRUCTIONS 5000
+
+static void proc_runq_append(struct GuestProcess *proc) {
+  proc->next_runnable = NULL;
+  proc->prev_runnable = g_process_table.run_queue_tail;
+  if (g_process_table.run_queue_tail) {
+    g_process_table.run_queue_tail->next_runnable = proc;
+  } else {
+    g_process_table.run_queue_head = proc;
+  }
+  g_process_table.run_queue_tail = proc;
+}
+
+static void proc_runq_remove(struct GuestProcess *proc) {
+  if (proc->prev_runnable) {
+    proc->prev_runnable->next_runnable = proc->next_runnable;
+  } else if (g_process_table.run_queue_head == proc) {
+    g_process_table.run_queue_head = proc->next_runnable;
+  }
+  if (proc->next_runnable) {
+    proc->next_runnable->prev_runnable = proc->prev_runnable;
+  } else if (g_process_table.run_queue_tail == proc) {
+    g_process_table.run_queue_tail = proc->prev_runnable;
+  }
+  proc->next_runnable = NULL;
+  proc->prev_runnable = NULL;
+}
+
 /*
  * Allocate a new process slot.
  * - Enforces PPID validity: ppid must be 0 (init) or belong to an existing process.
@@ -122,6 +153,8 @@ struct GuestProcess *guest_proc_alloc(pid_t ppid) {
       proc->state = GUEST_PROC_CREATING;
       proc->block_reason = BLOCK_NONE;
       proc->machine = NULL;
+      proc->instruction_budget = GUEST_QUANTUM_INSTRUCTIONS;
+      proc_runq_append(proc);
       g_process_table.count++;
       return proc;
     }
@@ -161,6 +194,8 @@ struct GuestProcess *guest_proc_init_first(struct Machine *m, pid_t pid) {
     memset(proc, 0, sizeof(*proc));
     proc->pid = pid;
     proc->ppid = 0;
+    proc->instruction_budget = GUEST_QUANTUM_INSTRUCTIONS;
+    proc_runq_append(proc);
     g_process_table.count++;
   }
 
@@ -175,6 +210,84 @@ struct GuestProcess *guest_proc_init_first(struct Machine *m, pid_t pid) {
   g_process_table.current = proc;
   return proc;
 }
+/*
+ * B2 fork: create runnable child with deep-copied Machine continuation.
+ * - Allocates child GuestProcess (auto-enqueued, CREATING state).
+ * - NewMachine(system, parent) deep-copies registers, IP, FPU, segments.
+ * - Child RSP set to child_stack when non-zero (clone); otherwise inherits.
+ * - Child RAX forced to 0 (fork child return value).
+ * - Child IP advanced past trapping syscall instruction (oplen).
+ * - Child attached (CREATING->RUNNABLE), parent resumes normally.
+ * - Parent return value (child PID) is set by caller via SysFork return.
+ * Returns child PID (>0) on success, -1 with errno=EAGAIN/ENOMEM on failure.
+ * NOTE: private memory is still shared with parent until B4 eager-copy lands.
+ */
+pid_t guest_proc_fork(struct Machine *parent_m, u64 child_stack) {
+  struct GuestProcess *parent_proc = NULL;
+  struct GuestProcess *child_proc = NULL;
+  struct Machine *child_m = NULL;
+  int i;
+
+  if (!parent_m || !parent_m->system) {
+    errno = EINVAL;
+    return -1;
+  }
+
+  /* Resolve parent proc: prefer current, fall back to machine-pointer scan */
+  if (g_process_table.current &&
+      g_process_table.current->machine == parent_m) {
+    parent_proc = g_process_table.current;
+  } else {
+    for (i = 0; i < MAX_GUEST_PROCESSES; i++) {
+      struct GuestProcess *p = &g_process_table.procs[i];
+      if (p->state != GUEST_PROC_FREE && p->state != GUEST_PROC_REAPED &&
+          p->machine == parent_m) {
+        parent_proc = p;
+        break;
+      }
+    }
+  }
+  if (!parent_proc) {
+    errno = ESRCH;
+    return -1;
+  }
+
+  child_proc = guest_proc_alloc(parent_proc->pid);
+  if (!child_proc) {
+    errno = EAGAIN;
+    return -1;
+  }
+
+  child_m = NewMachine(parent_m->system, parent_m);
+  if (!child_m) {
+    proc_runq_remove(child_proc);
+    child_proc->state = GUEST_PROC_FREE;
+    child_proc->pid = 0;
+    g_process_table.count--;
+    errno = ENOMEM;
+    return -1;
+  }
+
+  if (child_stack != 0) {
+    Put64(child_m->sp, child_stack);
+  }
+
+  /* Child observes fork() returning 0, resuming after the trap */
+  Put64(child_m->ax, 0);
+  child_m->ip += child_m->oplen;
+
+  if (guest_proc_attach_machine(child_proc, child_m) != 0) {
+    proc_runq_remove(child_proc);
+    child_proc->state = GUEST_PROC_FREE;
+    child_proc->pid = 0;
+    g_process_table.count--;
+    errno = ENOMEM;
+    return -1;
+  }
+
+  return child_proc->pid;
+}
+
 
 /*
  * Lookup active process by PID.
@@ -325,6 +438,7 @@ int guest_proc_exit(struct GuestProcess *proc, int status) {
 
   /* Detach Machine: CPU execution context ends, process identity remains */
   proc->machine = NULL;
+  proc_runq_remove(proc);
 
   /* Transition to zombie */
   proc->state = GUEST_PROC_ZOMBIE;
@@ -381,6 +495,7 @@ int guest_proc_reap(struct GuestProcess *proc) {
   proc->next_zombie = NULL;
 
   /* Release table slot for recycling */
+  proc_runq_remove(proc);
   proc->state = GUEST_PROC_FREE;
   proc->pid = 0;
   proc->ppid = 0;

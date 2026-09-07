@@ -95,8 +95,16 @@ static BigFree *g_big_free = NULL; /* simple LIFO — size is rarely reused exac
  * wasm memory.grow helpers
  * ---------------------------------------------------------------------- */
 static void *bw_grow(size_t nslots) {
+    size_t cur = __builtin_wasm_memory_grow(0, 0); /* current pages probe */
     size_t prev = __builtin_wasm_memory_grow(0, nslots);
-    if (prev == (size_t)-1) return NULL;
+    if (prev == (size_t)-1) {
+        char p[160];
+        int pn = snprintf(p, sizeof(p),
+            "[T5M] WASM_GROW_FAIL req_pages=%zu cur_pages_before=%zu pid=%d uid=%d\n",
+            nslots, cur, (int)getpid(), (int)getuid());
+        if (pn > 0) { ssize_t w = write(2, p, (size_t)pn); (void)w; }
+        return NULL;
+    }
     return (void *)(uintptr_t)(prev * WASM_PAGE);
 }
 

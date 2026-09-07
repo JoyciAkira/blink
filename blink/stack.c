@@ -307,5 +307,7 @@ void OpPushEvq(P) {
 
 void OpPopEvq(P) {
   unsigned osz = kStackOsz[Osz(rde)][Mode(rde)];
-  WriteMemWord(GetModrmRegisterWordPointerWrite(A, osz), rde, osz, Pop(A, 0));
+  u64 x = Pop(A, 0);
+  u8 *p = GetModrmRegisterWordPointerWrite(A, osz);
+  WriteMemWord(p, rde, osz, x);
 }

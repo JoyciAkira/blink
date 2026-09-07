@@ -596,6 +596,28 @@ void CollectPageLocks(struct Machine *m) {
   }
 #endif
 }
+/* G12: release all held page locks at an exec boundary, regardless of
+ * recorded syscall depth. */
+void CollectPageLocksForce(struct Machine *m) {
+  int rc;
+  if (UNLIKELY((rc = pthread_mutex_lock(&m->system->pagelocks_lock)) != 0)) {
+    ERRF("PAGELOCK-RACE kind=force_mutex_lock tid=%d rc=%d", m->tid, rc);
+    unassert(!rc);
+  }
+  while (m->pagelocks.i) {
+    struct PageLock *lk__ = &m->pagelocks.p[--m->pagelocks.i];
+    ReleasePageLock(lk__, m);
+  }
+  if (UNLIKELY((rc = pthread_cond_broadcast(&m->system->pagelocks_cond)) != 0)) {
+    ERRF("PAGELOCK-RACE kind=force_cond_broadcast tid=%d rc=%d", m->tid, rc);
+    unassert(!rc);
+  }
+  if (UNLIKELY((rc = pthread_mutex_unlock(&m->system->pagelocks_lock)) != 0)) {
+    ERRF("PAGELOCK-RACE kind=force_mutex_unlock tid=%d rc=%d", m->tid, rc);
+    unassert(!rc);
+  }
+}
+
 
 // returns page directory entry associated with virtual address
 // @return raw page directory entry contents, or zero w/ errno

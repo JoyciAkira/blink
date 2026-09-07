@@ -65,9 +65,17 @@ static int FinishClose(struct Machine *m, int rc) {
 int SysClose(struct Machine *m, i32 fildes) {
   struct Fd *fd;
 #ifdef __wasm__
-  /* Fork-exec coalescing: record the child's close during the pending-fork
-   * window (applied in the child worker before execve). */
-  fork_coalesce_add_fd_action(WASM_SPAWN_FD_CLOSE, fildes, 0);
+  /* The synthetic child shares the parent's Blink fd table until exec.
+   * Defer its close to spawn_exec_entry; applying it here closes the
+   * parent's signal/stdout pipes and aborts posix_spawn before execve. */
+  if (g_fork_state.pending) {
+    LOCK(&m->system->fds.lock);
+    fd = GetFd(&m->system->fds, fildes);
+    UNLOCK(&m->system->fds.lock);
+    if (!fd) return ebadf();
+    fork_coalesce_add_fd_action(WASM_SPAWN_FD_CLOSE, fildes, 0);
+    return 0;
+  }
 #endif
   LOCK(&m->system->fds.lock);
   if ((fd = GetFd(&m->system->fds, fildes))) {

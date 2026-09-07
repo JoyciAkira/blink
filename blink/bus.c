@@ -48,9 +48,18 @@ void InitBus(void) {
 #ifndef HAVE_PTHREAD_PROCESS_SHARED
   if (g_bus) FreeBig(g_bus, sizeof(*g_bus));
 #endif
-  unassert(g_bus =
-               (struct Bus *)AllocateBig(sizeof(*g_bus), PROT_READ | PROT_WRITE,
-                                         BUS_MEMORY | MAP_ANONYMOUS_, -1, 0));
+  /* T5M: errno-clean allocation boundary diagnostics. */
+  extern int getpid(void);
+  extern int getuid(void);
+  errno = 0;
+  g_bus = (struct Bus *)AllocateBig(sizeof(*g_bus), PROT_READ | PROT_WRITE,
+                                     BUS_MEMORY | MAP_ANONYMOUS_, -1, 0);
+  if (!g_bus) {
+    int e = errno;
+    dprintf(2, "[T5M] BUS_ALLOC_FAIL size=%zu errno_after=%d pid=%d uid=%d\n",
+            sizeof(*g_bus), e, (int)getpid(), (int)getuid());
+  }
+  unassert(g_bus);
   unassert(!pthread_condattr_init(&cattr));
   unassert(!pthread_mutexattr_init(&mattr));
 #ifdef HAVE_PTHREAD_PROCESS_SHARED

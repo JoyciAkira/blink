@@ -123,6 +123,8 @@ pid_t guest_proc_alloc_pid(void);
 /* Process Allocation & Hierarchy */
 struct GuestProcess *guest_proc_alloc(pid_t ppid);
 struct GuestProcess *guest_proc_init_first(struct Machine *m, pid_t pid);
+/* B2 fork: create runnable child, deep-copy Machine; returns child PID or -1 */
+pid_t guest_proc_fork(struct Machine *parent_m, u64 child_stack);
 struct GuestProcess *guest_proc_find(pid_t pid);
 struct GuestProcess *guest_proc_find_parent(const struct GuestProcess *proc);
 int guest_proc_get_children(const struct GuestProcess *parent,

@@ -23,18 +23,21 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include "blink/alu.h"
 #include "blink/assert.h"
 #include "blink/atomic.h"
 #include "blink/biosrom.h"
 #include "blink/bitscan.h"
+#include "blink/guest-process.h"
 #include "blink/builtin.h"
 #include "blink/bus.h"
 #include "blink/case.h"
 #include "blink/debug.h"
 #include "blink/endian.h"
 #include "blink/flag.h"
+#include "blink/fork-coalesce.h"
 #include "blink/flags.h"
 #include "blink/fpu.h"
 #include "blink/jit.h"
@@ -2237,12 +2240,53 @@ void Actor(struct Machine *mm) {
 #else
   struct Machine *m;
 #endif
-  for (g_machine = mm, m = mm;;) {
+  static _Atomic(int) g12_spin_counter;
+  for (;;) {
+    /* N0D: wasm pthread_kill(SIGSYS) can zero _Thread_local g_machine.
+     * Rebind from the stack Machine* every tick so teardown SysExit /
+     * pthread_exit do not run with TLS tid=0 (wasm_user_call<0 / 139). */
+    g_machine = mm;
+    m = mm;
+#ifdef __wasm__
+    if (fork_coalesce_should_park(m)) {
+      atomic_store_explicit(&m->g12_parked, true, memory_order_release);
+      atomic_store_explicit(&m->attention, true, memory_order_release);
+      {
+        struct timespec ts = {0, 1000 * 1000};
+        nanosleep(&ts, 0);
+      }
+      continue;
+    }
+    atomic_store_explicit(&m->g12_parked, false, memory_order_relaxed);
+#endif
+    {
+      int sc = atomic_fetch_add_explicit(&g12_spin_counter, 1, memory_order_relaxed);
+      if (sc % 1000000 == 0) {
+        ERRF("G12-SPIN-TID%d ip=%#llx", m->tid, (unsigned long long)m->ip);
+      }
+    }
 #ifndef __CYGWIN__
     STATISTIC(++interps);
 #endif
     if (!atomic_load_explicit(&m->attention, memory_order_acquire)) {
       ExecuteInstruction(m);
+      // B2 cooperative scheduler: decrement current process budget,
+      // round-robin to next RUNNABLE process on quantum expiry.
+      if (g_process_table.count > 1 && g_process_table.current &&
+          g_process_table.current->machine == m &&
+          g_process_table.current->state == GUEST_PROC_RUNNABLE) {
+        if (--g_process_table.current->instruction_budget == 0) {
+          struct GuestProcess *cur = g_process_table.current;
+          struct GuestProcess *nxt = cur->next_runnable ? cur->next_runnable
+                                                        : g_process_table.run_queue_head;
+          cur->instruction_budget = 5000;
+          if (nxt && nxt != cur && nxt->state == GUEST_PROC_RUNNABLE && nxt->machine) {
+            g_process_table.current = nxt;
+            m = nxt->machine;
+            g_machine = m;
+          }
+        }
+      }
     } else {
       CheckForSignals(m);
     }

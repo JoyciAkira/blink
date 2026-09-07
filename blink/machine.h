@@ -427,6 +427,7 @@ struct Machine {               //
   int sigdepth;                          //
   int sysdepth;                          //
   _Atomic(bool) killed;                  // [attention] slay this thread
+  _Atomic(bool) g12_parked;              // N0D: sibling parked for fake-fork
   _Atomic(bool) invalidated;             // the tlb must be flushed
   bool restored;                         // [attention] rt_sigreturn()'d
   bool selfmodifying;                    // [attention] need usmc restore
@@ -466,6 +467,7 @@ void FreeSystem(struct System *);
 void SignalActor(struct Machine *);
 void SetMachineMode(struct Machine *, struct XedMachineMode);
 struct Machine *NewMachine(struct System *, struct Machine *);
+struct Machine *GetMachineByHostThread(struct System *);
 i64 AreAllPagesUnlocked(struct System *) nosideeffect;
 bool IsOrphan(struct Machine *) nosideeffect;
 _Noreturn void Blink(struct Machine *);
@@ -527,6 +529,7 @@ u8 *BeginStoreNp(struct Machine *, i64, size_t, void *[2], u8 *);
 int GetFileDescriptorLimit(struct System *);
 bool HasPageLock(const struct Machine *, i64) nosideeffect;
 void CollectPageLocks(struct Machine *);
+void CollectPageLocksForce(struct Machine *);
 void G12CapturePagePath(struct System *, u64, bool);
 void G12NoteTargetMprotect(struct System *, u64, u64, int, int, bool);
 void G12NoteTargetUnmap(struct System *, u64, u64);

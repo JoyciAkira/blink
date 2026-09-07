@@ -62,6 +62,7 @@
 #include "blink/errno.h"
 #include "blink/flag.h"
 #include "blink/fork-coalesce.h"
+#include "blink/guest-process.h"
 #include "blink/iovs.h"
 #include "blink/limits.h"
 #include "blink/linux.h"
@@ -267,6 +268,23 @@ bool DeliverSignalRecursively(struct Machine *m, int sig) {
 bool CheckInterrupt(struct Machine *m, bool restartable) {
   bool res, restart;
   int sig, delivered;
+#ifdef __wasm__
+  g_machine = m;
+  if (fork_coalesce_unreaped_child()) {
+    fork_coalesce_check_child(m);
+  }
+  if (fork_coalesce_should_park(m)) {
+    atomic_store_explicit(&m->g12_parked, true, memory_order_release);
+    m->interrupted = true;
+    errno = EINTR;
+    return true;
+  }
+  if (atomic_load_explicit(&m->killed, memory_order_acquire)) {
+    m->interrupted = true;
+    errno = EINTR;
+    return true;
+  }
+#endif
   // an actual i/o call just received EINTR from the kernel
 HandleSomeMoreInterrupts:
   // determine if there's any signals pending for our guest
@@ -343,8 +361,11 @@ static void ClearChildTid(struct Machine *m) {
     THR_LOGF("ClearChildTid(%#" PRIx64 ")", m->ctid);
     if ((ctid = (_Atomic(int) *)LookupAddress(m, m->ctid))) {
       atomic_store_explicit(ctid, 0, memory_order_seq_cst);
+      ERRF("G12-CLEARTID-HIT tid=%d ctid=%#" PRIx64 " ptr=%p ok",
+           m->tid, m->ctid, (void *)ctid);
     } else {
       THR_LOGF("invalid clear child tid address %#" PRIx64, m->ctid);
+      ERRF("G12-CLEARTID-MISS tid=%d ctid=%#" PRIx64, m->tid, m->ctid);
     }
   }
   SysFutexWake(m, m->ctid, INT_MAX);
@@ -353,6 +374,16 @@ static void ClearChildTid(struct Machine *m) {
 
 _Noreturn void SysExitGroup(struct Machine *m, int rc) {
   THR_LOGF("pid=%d tid=%d SysExitGroup", m->system->pid, m->tid);
+#ifdef __wasm__
+  g_machine = m;
+  ERRF("G12-EXITGROUP tid=%d rc=%d ip=%#" PRIx64, m->tid, rc, m->ip);
+  /* N0D: leftover CLONE_THREAD worker exit_group must not KillOtherThreads
+   * the leader. Demote to thread exit (clears ctid, wakes joiner). */
+  if (m->tid != m->system->pid && !IsOrphan(m)) {
+    ERRF("G12-EXITGROUP-DEMOTE tid=%d rc=%d -> SysExit", m->tid, rc);
+    SysExit(m, rc);
+  }
+#endif
   ClearChildTid(m);
   if (m->system->isfork) {
 #ifndef NDEBUG
@@ -373,6 +404,13 @@ _Noreturn void SysExitGroup(struct Machine *m, int rc) {
       m->system->exitcode = rc;
       HaltMachine(m, kMachineExitTrap);
     }
+#ifdef __wasm__
+    /* N0D: skip FreeSystem/atexit after leftover KOT. FreePage during
+     * FreeSystem trapped wasm_user_call<0 -> 139. Host _Exit maps to
+     * kernel do_exit(rc). */
+    ERRF("G12-EXITGROUP-_Exit tid=%d rc=%d", m->tid, rc);
+    _Exit(rc);
+#else
     FreeMachine(m);
 #ifdef HAVE_JIT
     ShutdownJit();
@@ -383,11 +421,15 @@ _Noreturn void SysExitGroup(struct Machine *m, int rc) {
     }
 #endif
     exit(rc);
+#endif
   }
 }
 
 _Noreturn void SysExit(struct Machine *m, int rc) {
 #ifdef HAVE_THREADS
+#ifdef __wasm__
+  g_machine = m;
+#endif
   THR_LOGF("pid=%d tid=%d SysExit", m->system->pid, m->tid);
   if (IsOrphan(m)) {
     SysExitGroup(m, rc);
@@ -481,7 +523,15 @@ static int SysFork(struct Machine *m) {
 #if defined(HAVE_FORK)
   return Fork(m, 0, 0, 0);
 #elif defined(__wasm__)
-  return fork_coalesce_begin(m);
+  /* Candidate B: real fork via GuestProcess when table initialized.
+   * Falls back to fork-coalesce for pre-init boot or allocation failure. */
+  if (g_process_table.initialized) {
+    pid_t child_pid = guest_proc_fork(m, 0);
+    if (child_pid > 0) {
+      return child_pid;
+    }
+  }
+  return fork_coalesce_begin(m, 0);
 #else
   return enosys();
 #endif
@@ -604,11 +654,18 @@ static int SysClone(struct Machine *m, u64 flags, u64 stack, u64 ptid, u64 ctid,
     return Fork(m, flags, stack, ctid);
 #else
 #ifdef __wasm__
+  /* Candidate B: real fork via GuestProcess when table initialized. */
+  if (g_process_table.initialized) {
+    pid_t child_pid = guest_proc_fork(m, stack);
+    if (child_pid > 0) {
+      return child_pid;
+    }
+  }
     /* Fork-exec coalescing: return 0 (child branch) so libuv's
      * uv__process_child_init runs, recording fd actions; the real child is
      * spawned at execve via the kernel's fn-based clone. */
     ERRF("FORK-COALESCE: SysClone flags=%#lx", flags);
-    return fork_coalesce_begin(m);
+    return fork_coalesce_begin(m, stack);
 #else
     LOGF("forking support disabled");
     return enosys();
@@ -1361,15 +1418,26 @@ static int Dup3(struct Machine *m, int fildes, int newfildes, int flags) {
 static int SysDup2(struct Machine *m, i32 fildes, i32 newfildes) {
   int rc, oflags;
   struct Fd *fd;
-#ifdef __wasm__
-  /* Fork-exec coalescing: record the child's dup2 during the pending-fork
-   * window instead of applying it to the (shared) parent fd table. */
-  fork_coalesce_add_fd_action(WASM_SPAWN_FD_DUP2, fildes, newfildes);
-#endif
   if (newfildes < 0) {
     LOGF("dup2() ebadf");
     return ebadf();
   }
+#ifdef __wasm__
+  /* N0D: record-only. Applying 19->1 / 21->2 onto the shared parent fd
+   * table hid fork_coalesce_exec and let the parent HALT_KERNEL. */
+  if (g_fork_state.pending) {
+    LOCK(&m->system->fds.lock);
+    fd = GetFd(&m->system->fds, fildes);
+    UNLOCK(&m->system->fds.lock);
+    if (!fd) return ebadf();
+    if (fildes != newfildes) {
+      if (newfildes >= GetFileDescriptorLimit(m->system)) return ebadf();
+      fork_coalesce_add_fd_action(WASM_SPAWN_FD_DUP2, fildes, newfildes);
+      ERRF("G12-DUP2-DEFER src=%d dst=%d", fildes, newfildes);
+    }
+    return newfildes;
+  }
+#endif
   if (fildes == newfildes) {
     // no-op system call, but still must validate
     LOCK(&m->system->fds.lock);
@@ -1399,13 +1467,21 @@ static int SysDup3(struct Machine *m, i32 fildes, i32 newfildes, i32 flags) {
   int rc;
   int oflags;
   struct Fd *fd;
-#ifdef __wasm__
-  fork_coalesce_add_fd_action(WASM_SPAWN_FD_DUP3, fildes, newfildes);
-#endif
   if (newfildes < 0) return ebadf();
   if (fildes == newfildes) return einval();
   if (flags & ~O_CLOEXEC_LINUX) return einval();
   if (newfildes >= GetFileDescriptorLimit(m->system)) return ebadf();
+#ifdef __wasm__
+  if (g_fork_state.pending) {
+    LOCK(&m->system->fds.lock);
+    fd = GetFd(&m->system->fds, fildes);
+    UNLOCK(&m->system->fds.lock);
+    if (!fd) return ebadf();
+    fork_coalesce_add_fd_action(WASM_SPAWN_FD_DUP3, fildes, newfildes);
+    ERRF("G12-DUP3-DEFER src=%d dst=%d", fildes, newfildes);
+    return newfildes;
+  }
+#endif
 #ifdef HAVE_DUP3
   if ((rc = Dup3(m, fildes, newfildes, XlatOpenFlags(flags))) != -1) {
 #else
@@ -2361,6 +2437,208 @@ static int SysGetsockopt(struct Machine *m, i32 fildes, i32 level, i32 optname,
   return rc;
 }
 
+/* ── T5O: Linux signalfd / signalfd4 (guest-virtual, host-eventfd substrate)─
+ *
+ * Guest semantics per Linux: object created with a signal mask; readable when
+ * a signal pending on the calling task is in the mask; read() consumes those
+ * signals as 128-byte signalfd_siginfo records and removes them from the
+ * task's pending set (no later handler delivery — no double consumption).
+ * Readiness for poll/select/epoll comes from the underlying host eventfd
+ * written by SignalfdNotifyOnSignal() when a matching signal is enqueued.
+ * SIGKILL/SIGSTOP are filtered from the mask as Linux does. sigsetsize must
+ * be 8 on x86-64. No host-signal-domain passthrough: the eventfd is only a
+ * wake substrate; the data and consumption live in Blink's guest model. */
+#define SIGNALFD_MAX 16
+#define SFD_NONBLOCK_LINUX 0x0800
+#define SFD_CLOEXEC_LINUX  0x080000
+
+struct SignalFdEntry {
+  int hostfd;   /* host eventfd serving as the fd substrate */
+  u64 mask;     /* guest signal mask (bit n-1 = signal n) */
+  bool in_use;
+};
+
+static struct SignalFdEntry g_signalfd[SIGNALFD_MAX];
+
+static struct SignalFdEntry *SignalfdFind(int hostfd) {
+  for (int i = 0; i < SIGNALFD_MAX; ++i) {
+    if (g_signalfd[i].in_use && g_signalfd[i].hostfd == hostfd) {
+      return &g_signalfd[i];
+    }
+  }
+  return 0;
+}
+static ssize_t SignalfdReadvHost(int, const struct iovec *, int);
+static ssize_t SignalfdWritevHost(int, const struct iovec *, int);
+static int SignalfdPollHost(struct pollfd *, nfds_t, int);
+static int SignalfdCloseHost(int);
+static const struct FdCb kFdCbSignal = {
+    SignalfdCloseHost,
+    SignalfdReadvHost,
+    SignalfdWritevHost,
+    SignalfdPollHost,
+};
+
+static ssize_t SignalfdReadvHost(int fd, const struct iovec *v, int n) {
+  return readv(fd, v, n);  /* substrate only; SysRead intercepts first */
+}
+static ssize_t SignalfdWritevHost(int fd, const struct iovec *v, int n) {
+  return writev(fd, v, n);
+}
+static int SignalfdPollHost(struct pollfd *p, nfds_t n, int t) {
+  return poll(p, n, t);  /* eventfd readiness drives poll/select/epoll */
+}
+static int SignalfdCloseHost(int fd) {
+  struct SignalFdEntry *e = SignalfdFind(fd);
+  if (e) e->in_use = false;
+  return close(fd);
+}
+
+
+/* Called from EnqueueSignal(): a guest signal just became pending on some
+ * machine. Wake every signalfd whose mask includes it. */
+void SignalfdNotifyOnSignal(int sig) {
+  if (!(1 <= sig && sig <= 64)) return;
+  for (int i = 0; i < SIGNALFD_MAX; ++i) {
+    if (g_signalfd[i].in_use && (g_signalfd[i].mask & (1ull << (sig - 1)))) {
+      uint64_t one = 1;
+      ssize_t w = write(g_signalfd[i].hostfd, &one, sizeof(one));
+      (void)w;
+    }
+  }
+}
+
+/* Linux struct signalfd_siginfo is exactly 128 bytes. */
+struct SignalFdSigInfo {
+  u32 ssi_signo;
+  u32 ssi_errno;
+  u32 ssi_code;
+  u32 ssi_pid;
+  u32 ssi_uid;
+  u32 _pad[(128 - 5 * sizeof(u32)) / sizeof(u32)];
+};
+_Static_assert(sizeof(struct SignalFdSigInfo) == 128, "siginfo size");
+
+static i64 SysSignalfd4(struct Machine *m, i64 gfd, i64 maskaddr,
+                        i64 sigsetsize, u64 flags) {
+  u64 mask;
+  struct Fd *fd;
+  ERRF("[T5O] CALL gfd=%lld maskaddr=%#llx siz=%lld flags=%#llx tid=%d",
+       (long long)gfd, (unsigned long long)maskaddr, (long long)sigsetsize,
+       (unsigned long long)flags, m->tid);
+  if (flags & ~(u64)(SFD_NONBLOCK_LINUX | SFD_CLOEXEC_LINUX)) {
+    ERRF("[T5O] EINVAL flags=%#llx sigsetsize=%lld", (unsigned long long)flags, (long long)sigsetsize);
+    return einval();
+  }
+  /* Reference parity (observed on current x86-64 Linux): non-8 sigsetsize is
+   * accepted; the mask read is clamped to sizeof(kernel sigset_t) = 8. */
+  u64 nbytes = sigsetsize < 8 ? (u64)sigsetsize : 8;
+  memset(&mask, 0, sizeof(mask));
+  if (nbytes && CopyFromUser(m, &mask, maskaddr, (size_t)nbytes) == -1) {
+    ERRF("[T5O] mask copy failed");
+    return -1;
+  }
+  /* Linux ignores SIGKILL/SIGSTOP in the signalfd mask. */
+  mask &= ~((1ull << (9 - 1)) | (1ull << (19 - 1)));
+  int ifd = (int)(u32)gfd;  /* fd arg is int; guest -1 arrives zero-extended */
+  if (ifd >= 0) {
+    LOCK(&m->system->fds.lock);
+    if ((fd = GetFd(&m->system->fds, ifd))) {
+      struct SignalFdEntry *e = SignalfdFind((int)gfd);
+      if (fd->cb == &kFdCbSignal && e) {
+        e->mask = mask;
+        UNLOCK(&m->system->fds.lock);
+        return ifd;
+      }
+    }
+    UNLOCK(&m->system->fds.lock);
+    return einval();  /* Linux: update of a non-signalfd fd -> EINVAL */
+  }
+  int hostfd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+  if (hostfd == -1) {
+    ERRF("[T5O] eventfd failed errno=%d", errno);
+    return -1;
+  }
+  LOCK(&m->system->fds.lock);
+  if (!(fd = AddFd(&m->system->fds, hostfd,
+                   (flags & SFD_NONBLOCK_LINUX) ? O_NONBLOCK : 0))) {
+    UNLOCK(&m->system->fds.lock);
+    ERRF("[T5O] AddFd failed");
+    close(hostfd);
+    return -1;
+  }
+  fd->cb = &kFdCbSignal;
+  UNLOCK(&m->system->fds.lock);
+  struct SignalFdEntry *e = 0;
+  for (int i = 0; i < SIGNALFD_MAX; ++i) {
+    if (!g_signalfd[i].in_use) {
+      e = &g_signalfd[i];
+      break;
+    }
+  }
+  if (!e) {
+    close(hostfd);
+    return einval();  /* registry exhausted */
+  }
+  e->in_use = true;
+  e->hostfd = hostfd;
+  e->mask = mask;
+  ERRF("[T5O] CREATED hostfd=%d mask=%#llx", hostfd, (unsigned long long)mask);
+  return hostfd;
+}
+
+
+static i64 SysSignalfdRead(struct Machine *m, i32 fildes, i64 addr, u64 size) {
+  struct SignalFdEntry *e = SignalfdFind(fildes);
+  if (!e) return ebadf();
+  if (size < 128) return einval();  /* Linux: buffer smaller than siginfo */
+  u64 count = size / 128;
+  u64 records = 0;
+  /* consume pending signals of THIS task that match the mask */
+  u64 match;
+  while (records < count && (match = m->signals & e->mask)) {
+    int sig = __builtin_ctzll(match) + 1;
+    m->signals &= ~(1ull << (sig - 1));  /* consumed: handler path skips it */
+    struct SignalFdSigInfo si;
+    memset(&si, 0, sizeof(si));
+    si.ssi_signo = (u32)sig;
+    si.ssi_errno = 0;
+    si.ssi_code = 0;  /* SI_USER; detailed origin not retained by the model */
+    si.ssi_pid = 0;
+    si.ssi_uid = 0;
+    if (CopyToUserWrite(m, addr + (i64)(records * 128), &si, sizeof(si)) == -1) {
+      return -1;
+    }
+    ++records;
+  }
+  if (!records) {
+    /* drain a stale wake so readiness clears, then report per flags */
+    uint64_t v;
+    (void)read(fildes, &v, sizeof(v));
+    int nonblock = 0;
+    LOCK(&m->system->fds.lock);
+    struct Fd *fd = GetFd(&m->system->fds, fildes);
+    if (fd) nonblock = fd->oflags & O_NONBLOCK;
+    UNLOCK(&m->system->fds.lock);
+    if (nonblock) return eagain();
+    /* blocking fd: wait on the eventfd substrate for a matching wake */
+    for (;;) {
+      if (CheckInterrupt(m, false)) return eintr();
+      if (m->signals & e->mask) break;
+      struct pollfd p = {(int)fildes, POLLIN, 0};
+      if (poll(&p, 1, -1) == -1) {
+        if (errno == EINTR) continue;
+        return -1;
+      }
+    }
+    return SysSignalfdRead(m, fildes, addr, size);
+  }
+  if (!(m->signals & e->mask)) {
+    uint64_t v;
+    (void)read(fildes, &v, sizeof(v));  /* clear readiness */
+  }
+  return (i64)(records * 128);
+}
 static i64 SysRead(struct Machine *m, i32 fildes, i64 addr, u64 size) {
   i64 rc;
   int oflags;
@@ -2379,6 +2657,7 @@ static i64 SysRead(struct Machine *m, i32 fildes, i64 addr, u64 size) {
   }
   UNLOCK(&m->system->fds.lock);
   if (!fd) return -1;
+  if (fd->cb == &kFdCbSignal) return SysSignalfdRead(m, fildes, addr, size);
   if ((oflags & O_ACCMODE) == O_WRONLY) return ebadf();
   if (size) {
     InitIovs(&iv);
@@ -3328,6 +3607,57 @@ static int SysFcntl(struct Machine *m, i32 fildes, i32 cmd, i64 arg) {
   return rc;
 }
 
+// T5R: guest executable identity through procfs (generic).
+//
+// The DISABLE_VFS build compiles out blink's VFS layer entirely: no procfs
+// device is mounted and VfsReadlink is a raw passthrough to the host kernel,
+// so an emulated process asking for its own executable gets the OUTER
+// executable (/bin/blink) instead. Linux semantics for the emulated process
+// require /proc/self/exe to resolve to the loaded guest program. Serve the
+// exact current-process identity paths from the program registered by the
+// loader (m->system->elf.prog); every other path — including other PIDs and
+// non-proc symlinks — passes through unchanged. Fail closed (ENOENT) when no
+// guest executable has been registered, matching the procfs device behavior
+// with a NULL self-exe info.
+#ifdef DISABLE_VFS
+static bool IsCurrentGuestProcExePath(const char *path) {
+  const char *rest;
+  char *end;
+  long pid;
+  if (!path) return false;
+  if (!strcmp(path, "/proc/self/exe")) return true;
+  if (strncmp(path, "/proc/", 6) != 0) return false;
+  rest = path + 6;
+  pid = strtol(rest, &end, 10);
+  return end > rest && !strcmp(end, "/exe") && pid == getpid();
+}
+
+static ssize_t SysReadlinkat(struct Machine *m, int dirfd, i64 path,
+                             i64 bufaddr, i64 bufsiz) {
+  char *buf;
+  ssize_t rc;
+  // This system call raises EINVAL when "bufsiz is not positive."
+  // ──Quoth the Linux Programmer's Manual § readlink(2). Some libc
+  // implementations (e.g. Musl) consider it to be posixly incorrect.
+  if (bufsiz <= 0) return einval();
+  if (IsCurrentGuestProcExePath(LoadStr(m, path))) {
+    const char *guest_prog = m->system->elf.prog;
+    if (!m->system->loaded || !guest_prog || !*guest_prog) {
+      return enoent();  // fail closed: no registered guest executable
+    }
+    size_t len = strlen(guest_prog);
+    if (len > (size_t)bufsiz) len = (size_t)bufsiz;  // readlink truncation
+    if (CopyToUserWrite(m, bufaddr, (void *)guest_prog, len) == -1) return -1;
+    return (ssize_t)len;
+  }
+  if (!(buf = (char *)AddToFreeList(m, malloc(bufsiz)))) return -1;
+  if ((rc = VfsReadlink(GetDirFildes(dirfd), LoadStr(m, path), buf, bufsiz)) !=
+      -1) {
+    if (CopyToUserWrite(m, bufaddr, buf, rc) == -1) rc = -1;
+  }
+  return rc;
+}
+#else
 static ssize_t SysReadlinkat(struct Machine *m, int dirfd, i64 path,
                              i64 bufaddr, i64 bufsiz) {
   char *buf;
@@ -3343,6 +3673,7 @@ static ssize_t SysReadlinkat(struct Machine *m, int dirfd, i64 path,
   }
   return rc;
 }
+#endif
 
 static int SysChmod(struct Machine *m, i64 path, u32 mode) {
   return SysFchmodat(m, AT_FDCWD_LINUX, path, mode);
@@ -3624,6 +3955,29 @@ static int SysWait4(struct Machine *m, int pid, i64 opt_out_wstatus_addr,
        !IsValidMemory(m, opt_out_rusage_addr, sizeof(grusage), PROT_WRITE))) {
     return -1;
   }
+#ifdef __wasm__
+  /* G12: once check_child reaped the kernel child, satisfy libuv waitpid
+   * from the stash so the close event fires. */
+  if (fork_coalesce_child_done() &&
+      (pid == g_fork_state.real_pid || pid == -1 ||
+       (pid < -1 && pid == -g_fork_state.real_pid))) {
+    if (opt_out_wstatus_addr) {
+      gwstatus = (i32)((((g_fork_state.child_status >> 8) & 0xff) << 8) |
+                       (g_fork_state.child_status & 0x7f));
+      Write32(gwstatusb, gwstatus);
+      CopyToUserWrite(m, opt_out_wstatus_addr, gwstatusb, sizeof(gwstatusb));
+    }
+    if (opt_out_rusage_addr) {
+      memset(&grusage, 0, sizeof(grusage));
+      CopyToUserWrite(m, opt_out_rusage_addr, &grusage, sizeof(grusage));
+    }
+    rc = g_fork_state.real_pid;
+    ERRF("G12-WAIT4-STASH pid=%d reaped=%d status=%d", pid, rc,
+         g_fork_state.child_status);
+    fork_coalesce_reap(g_fork_state.fake_pid);
+    return rc;
+  }
+#endif
 #ifdef HAVE_WAIT4
   RESTARTABLE(rc = wait4(pid, &wstatus, options, &hrusage));
 #else
@@ -4795,6 +5149,12 @@ static int Poll(struct Machine *m, i64 fdsaddr, u64 nfds,
 
 static int SysPoll(struct Machine *m, i64 fdsaddr, u64 nfds, i32 timeout_ms) {
   struct timespec deadline;
+#ifdef __wasm__
+  /* Never shrink guest timeout=-1 to 16ms. Poll() already slices with
+   * kPollingMs and CheckInterrupt runs check_child. Returning 0 for an
+   * infinite wait trips libuv uv__io_poll assert(timeout != -1). */
+  fork_coalesce_check_child(m);
+#endif
   if (timeout_ms < 0) {
     deadline = GetMaxTime();
   } else {
@@ -4954,6 +5314,7 @@ static int SysTkill(struct Machine *m, int tid, int sig) {
       return rc;
     } else {
       m->signals |= (u64)1 << (sig - 1);
+      SignalfdNotifyOnSignal(sig);  /* T5O: wake signalfd watchers */
       return 0;
     }
   }
@@ -5343,6 +5704,7 @@ static i32 SysEventfd2(struct Machine *m, u32 initval, i32 flags) {
     return einval();
   }
   if (!(lim = GetFileDescriptorLimit(m->system))) return emfile();
+  oflags |= O_RDWR;
   if ((fildes = eventfd(initval, sysflags)) != -1) {
     if (fildes >= lim) {
       close(fildes);
@@ -5370,6 +5732,7 @@ static i32 SysEpollCreate1(struct Machine *m, i32 flags) {
     return einval();
   }
   if (!(lim = GetFileDescriptorLimit(m->system))) return emfile();
+  oflags |= O_RDWR;
   if ((fildes = epoll_create1(sysflags)) != -1) {
     if (fildes >= lim) {
       close(fildes);
@@ -5447,6 +5810,9 @@ static i32 EpollPwait(struct Machine *m, i32 epfd, i64 eventsaddr,
     SIG_LOGF("sigmask push %" PRIx64, m->sigmask);
   }
   if (!CheckInterrupt(m, false)) {
+#ifdef __wasm__
+    int g12_slice_logged = 0;
+#endif
     do {
       now = GetTime();
       if (CompareTime(now, deadline) < 0) {
@@ -5454,6 +5820,33 @@ static i32 EpollPwait(struct Machine *m, i32 epfd, i64 eventsaddr,
       } else {
         waitfor = GetZeroTime();
       }
+#ifdef __wasm__
+      /* N0D: slice the *host* wait so check_child/freeze can run, but
+       * keep the original guest deadline. Returning 0 while deadline
+       * remains (timeout=-1 -> GetMaxTime) makes libuv hit
+       * assert(timeout != -1) in uv__io_poll. */
+      if (fork_coalesce_unreaped_child()) {
+        fork_coalesce_check_child(m);
+      }
+      if (fork_coalesce_should_park(m)) {
+        atomic_store_explicit(&m->g12_parked, true, memory_order_release);
+        m->interrupted = true;
+        errno = EINTR;
+        rc = -1;
+        break;
+      }
+      if (fork_coalesce_unreaped_child() || g_fork_state.freeze_siblings) {
+        struct timespec cap = FromMilliseconds(16);
+        if (CompareTime(waitfor, cap) > 0) {
+          if (!g12_slice_logged) {
+            ERRF("G12-PWAIT-SLICE tid=%d orig_sec=%lld cap_ms=16", m->tid,
+                 (long long)waitfor.tv_sec);
+            g12_slice_logged = 1;
+          }
+          waitfor = cap;
+        }
+      }
+#endif
 #if defined(HAVE_EPOLL_PWAIT2) && !defined(MUSL_CROSS_MAKE)
       rc = epoll_pwait2(epfd, events, maxevents, &waitfor, &oldmask);
 #else
@@ -5464,6 +5857,10 @@ static i32 EpollPwait(struct Machine *m, i32 epfd, i64 eventsaddr,
         if (CheckInterrupt(m, false)) {
           break;
         }
+#ifdef __wasm__
+      } else if (rc == 0 && CompareTime(GetTime(), deadline) < 0) {
+        continue;
+#endif
       } else {
         break;
       }
@@ -5491,6 +5888,10 @@ static i32 SysEpollPwait(struct Machine *m, i32 epfd, i64 eventsaddr,
                          i32 maxevents, i32 timeout, i64 sigmaskaddr,
                          u64 sigsetsize) {
   struct timespec deadline;
+#ifdef __wasm__
+  /* Host 16ms slice lives in EpollPwait. Do not rewrite guest timeout=-1. */
+  fork_coalesce_check_child(m);
+#endif
   if (timeout >= 0) {
     deadline = AddTime(GetTime(), FromMilliseconds(timeout));
   } else {
@@ -5504,6 +5905,10 @@ static i32 SysEpollPwait2(struct Machine *m, i32 epfd, i64 eventsaddr,
                           i32 maxevents, i64 timeoutaddr, i64 sigmaskaddr,
                           u64 sigsetsize) {
   struct timespec ts, deadline;
+#ifdef __wasm__
+  if (fork_coalesce_unreaped_child())
+    fork_coalesce_check_child(m);
+#endif
   if (timeoutaddr) {
     if (LoadTimespecR(m, timeoutaddr, &ts) == -1) return -1;
     deadline = AddTime(GetTime(), ts);
@@ -5808,6 +6213,11 @@ void OpSyscall(P) {
       // time() is also noisy in some environments.
       ax = SysTime(m, di);
       break;
+    case 0x11a:
+    case 0x121:
+      // signalfd / signalfd4 (T5O)
+      ax = SysSignalfd4(m, di, si, dx, (u64)r0);
+      break;
     default:
     DefaultCase:
       LOGF("missing syscall 0x%03" PRIx64, ax);
@@ -5819,6 +6229,9 @@ void OpSyscall(P) {
   }
   unassert(--m->sysdepth >= 0);
   CollectPageLocks(m);
+  if (m->sysdepth == 0 && m->pagelocks.i) {
+    CollectPageLocksForce(m);
+  }
   unassert(!m->pagelocks.i || m->sysdepth);
   CollectGarbage(m, mark);
 #ifdef __wasm__
@@ -5827,4 +6240,5 @@ void OpSyscall(P) {
     UNLOCK(&g_g12_serialize_lock);
   }
 #endif
+  m->insyscall = false;
 }
