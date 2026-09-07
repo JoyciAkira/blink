@@ -92,8 +92,8 @@
 #define PAGE_V     0x0000000000000001  // valid
 #define PAGE_RW    0x0000000000000002  // writeable
 #define PAGE_U     0x0000000000000004  // permit ring3 access or read protect
+#define PAGE_SHARED 0x0000000000000020  // MAP_SHARED mapping (shared across fork)
 #define PAGE_PS    0x0000000000000080  // IsPage (PDPTE/PDE) or PAT (PT)
-#define PAGE_G     0x0000000000000100  // global
 #define PAGE_RSRV  0x0000000000000200  // PAGE_TA bits havent been chosen yet
 #define PAGE_HOST  0x0000000000000400  // PAGE_TA bits point to system memory
 #define PAGE_MAP   0x0000000000000800  // PAGE_TA bits are a linear host mmap

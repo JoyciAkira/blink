@@ -524,8 +524,11 @@ static int DeepCopyPageTablesLevel(struct System *child,
     }
     if (level == 12) {
       /* Leaf PTE */
-      if ((pentry & PAGE_HOST) && (pentry & PAGE_RW)) {
-        /* Writable private page: allocate new host page, copy contents */
+      if (pentry & PAGE_SHARED) {
+        /* MAP_SHARED mapping: always share as-is (B5 correctness) */
+        Store64(child_table + i * 8, pentry);
+      } else if (pentry & PAGE_HOST) {
+        /* Private page (writable OR read-only): deep-copy to prevent mprotect aliasing (B4 completeness) */
         u64 new_pte = AllocateAnonymousPage(child);
         if (new_pte == (u64)-1) return -1;
         u8 *src = FindHostPage(pentry);
@@ -536,7 +539,7 @@ static int DeepCopyPageTablesLevel(struct System *child,
         new_pte |= (pentry & ~(u64)PAGE_TA);
         Store64(child_table + i * 8, new_pte);
       } else {
-        /* Read-only, file-mapped, or non-host: share as-is */
+        /* Non-host (e.g. code, RSRV): share as-is */
         Store64(child_table + i * 8, pentry);
       }
     } else {
@@ -1145,6 +1148,7 @@ i64 ReserveVirtual(struct System *s, i64 virt, i64 size, u64 flags, int fd,
     vss_delta += pages;
     s->memstat.reserved += pages;
     flags |= PAGE_HOST | PAGE_MAP | PAGE_MUG | PAGE_RSRV;
+    if (shared) flags |= PAGE_SHARED;
   } else {
     flags |= PAGE_RSRV;
     vss_delta += pages;
