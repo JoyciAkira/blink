@@ -39,7 +39,7 @@
 #include <unistd.h>
 #include <sys/wait.h>
 #include <sys/stat.h>
-#include <fcntl.h>
+#include <sys/mman.h>
 #include <errno.h>
 #include <string.h>
 #include <stdlib.h>
@@ -369,7 +369,7 @@ int spawn_exec_entry(void *arg) {
     } else if (req->actions[i].op == WASM_SPAWN_FD_CLOSE) {
       close(req->actions[i].src_fd);
     } else if (req->actions[i].op == WASM_SPAWN_FD_DUP3) {
-      dup3(req->actions[i].src_fd, req->actions[i].dst_fd, 0);
+      dup2(req->actions[i].src_fd, req->actions[i].dst_fd);
     } else if (req->actions[i].op == WASM_SPAWN_FD_OPEN) {
       int fd = open(req->actions[i].path, req->actions[i].flags, req->actions[i].mode);
       if (fd >= 0 && fd != req->actions[i].dst_fd) {

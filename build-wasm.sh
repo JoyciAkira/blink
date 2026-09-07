@@ -32,7 +32,7 @@ for f in blink/*.c; do
     #       oneoff.c (test binary),
     #       compress.c (needs zlib, only used by blinkenlights)
     case "$basename" in
-        demangle.c|blinkenlights.c|oneoff.c|compress.c)
+        demangle.c|blinkenlights.c|oneoff.c|compress.c|ioctl.c|cpucount.c|sysinfo.c)
             echo "  SKIP $f" >&2
             continue
             ;;
@@ -50,9 +50,13 @@ done
 wait
 echo "All source files compiled."
 
-# Compile the fixed mmap shim
-echo "  CC  blink-wasm-mman-impl.c"
-clang $CFLAGS -c -o "$OUTDIR/blink-wasm-mman-impl.o" "blink-wasm-mman-impl.c" 2>&1
+ # Compile the wasm stubs for missing host functions
+ echo "  CC  blink-wasm-stubs.c"
+ clang $CFLAGS -c -o "$OUTDIR/blink-wasm-stubs.o" "blink-wasm-stubs.c" 2>&1
+ 
+ # Compile the fixed mmap shim
+ echo "  CC  blink-wasm-mman-impl.c"
+ clang $CFLAGS -c -o "$OUTDIR/blink-wasm-mman-impl.o" "blink-wasm-mman-impl.c" 2>&1
 
 # Count
 OBJ_COUNT=$(ls "$OUTDIR"/*.o 2>/dev/null | wc -l)

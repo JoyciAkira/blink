@@ -487,6 +487,8 @@ int LoadInstruction2(struct Machine *, u64);
 void ExecuteInstruction(struct Machine *);
 u64 AllocatePageTable(struct System *);
 u64 AllocateAnonymousPage(struct System *);
+struct System *CloneSystemForFork(struct System *parent);
+int DeepCopyPageTables(struct System *child, const struct System *parent);
 void FreeAnonymousPage(struct System *, u8 *);
 u64 FindPageTableEntry(struct Machine *, u64);
 bool CheckMemoryInvariants(struct System *) nosideeffect dontdiscard;

@@ -571,9 +571,7 @@ static int Fork(struct Machine *m, u64 flags, u64 stack, u64 ctid) {
 }
 
 static int SysFork(struct Machine *m) {
-#if defined(HAVE_FORK)
-  return Fork(m, 0, 0, 0);
-#elif defined(__wasm__)
+#if defined(__wasm__)
   /* Candidate B: real fork via GuestProcess when table initialized. */
   if (g_process_table.initialized) {
     pid_t child_pid = guest_proc_fork(m, 0);
@@ -582,6 +580,8 @@ static int SysFork(struct Machine *m) {
     }
   }
   return fork_coalesce_begin(m, 0);
+#elif defined(HAVE_FORK)
+  return Fork(m, 0, 0, 0);
 #else
   return enosys();
 #endif
@@ -700,26 +700,20 @@ static bool IsForkOrVfork(u64 flags) {
 static int SysClone(struct Machine *m, u64 flags, u64 stack, u64 ptid, u64 ctid,
                     u64 tls, u64 func) {
   if (IsForkOrVfork(flags)) {
-#ifdef HAVE_FORK
-    return Fork(m, flags, stack, ctid);
-#else
-#ifdef __wasm__
-  /* Candidate B: real fork via GuestProcess when table initialized. */
-  if (g_process_table.initialized) {
-    pid_t child_pid = guest_proc_fork(m, stack);
-    if (child_pid > 0) {
-      return child_pid;
+#if defined(__wasm__)
+    if (g_process_table.initialized) {
+      pid_t child_pid = guest_proc_fork(m, stack);
+      if (child_pid > 0) {
+        return child_pid;
+      }
     }
-  }
-    /* Fork-exec coalescing: return 0 (child branch) so libuv's
-     * uv__process_child_init runs, recording fd actions; the real child is
-     * spawned at execve via the kernel's fn-based clone. */
     ERRF("FORK-COALESCE: SysClone flags=%#lx", flags);
     return fork_coalesce_begin(m, stack);
+#elif defined(HAVE_FORK)
+    return Fork(m, flags, stack, ctid);
 #else
     LOGF("forking support disabled");
     return enosys();
-#endif
 #endif
   }
 #ifdef HAVE_THREADS

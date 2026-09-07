@@ -260,8 +260,27 @@ pid_t guest_proc_fork(struct Machine *parent_m, u64 child_stack) {
     return -1;
   }
 
-  child_m = NewMachine(parent_m->system, parent_m);
+  struct System *child_s = CloneSystemForFork(parent_m->system);
+  if (!child_s) {
+    proc_runq_remove(child_proc);
+    child_proc->state = GUEST_PROC_FREE;
+    child_proc->pid = 0;
+    g_process_table.count--;
+    errno = ENOMEM;
+    return -1;
+  }
+  if (DeepCopyPageTables(child_s, parent_m->system) != 0) {
+    FreeSystem(child_s);
+    proc_runq_remove(child_proc);
+    child_proc->state = GUEST_PROC_FREE;
+    child_proc->pid = 0;
+    g_process_table.count--;
+    errno = ENOMEM;
+    return -1;
+  }
+  child_m = NewMachine(child_s, parent_m);
   if (!child_m) {
+    FreeSystem(child_s);
     proc_runq_remove(child_proc);
     child_proc->state = GUEST_PROC_FREE;
     child_proc->pid = 0;

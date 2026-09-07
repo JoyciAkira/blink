@@ -452,11 +452,137 @@ void FreeSystem(struct System *s) {
   free(s);
 }
 
+/* B4: Clone a System for fork() with independent address space.
+ * Copies scalar config/state fields; allocates fresh cr3, mutexes, fds, jit.
+ * Does NOT copy page tables — caller must DeepCopyPageTables() after. */
+struct System *CloneSystemForFork(struct System *parent) {
+  struct System *child;
+  unassert(parent);
+  unassert(parent->mode.omode == XED_MODE_LONG);
+  child = NewSystem(parent->mode);
+  if (!child) return NULL;
+  /* Copy scalar configuration and state */
+  child->dlab = parent->dlab;
+  child->isfork = parent->isfork;
+  child->exited = false;
+  child->loaded = parent->loaded;
+  child->iscosmo = parent->iscosmo;
+  child->trapexit = parent->trapexit;
+  child->brkchanged = parent->brkchanged;
+  atomic_store_explicit(&child->killer, false, memory_order_relaxed);
+  child->gdt_limit = parent->gdt_limit;
+  child->idt_limit = parent->idt_limit;
+  child->exitcode = 0;
+  child->efer = parent->efer;
+  child->pid = parent->pid; /* will be overwritten by GuestProcess pid */
+  child->next_tid = 1;
+  child->gdt_base = parent->gdt_base;
+  child->idt_base = parent->idt_base;
+  child->cr0 = parent->cr0;
+  child->cr2 = parent->cr2;
+  child->cr4 = parent->cr4;
+  child->brk = parent->brk;
+  child->automap = parent->automap;
+  child->memchurn = 0;
+  child->codestart = parent->codestart;
+  child->codesize = parent->codesize;
+  atomic_store_explicit(&child->rss, 0, memory_order_relaxed);
+  atomic_store_explicit(&child->vss, 0, memory_order_relaxed);
+  memcpy(child->hands, parent->hands, sizeof(child->hands));
+  child->blinksigs = parent->blinksigs;
+  child->exec_sigmask = parent->exec_sigmask;
+  memcpy(child->rlim, parent->rlim, sizeof(child->rlim));
+  child->onfilemap = parent->onfilemap;
+  child->onsymbols = parent->onsymbols;
+  child->onbinbase = parent->onbinbase;
+  child->onlongbranch = parent->onlongbranch;
+  child->onromwriteattempt = parent->onromwriteattempt;
+  child->exec = parent->exec;
+  child->redraw = parent->redraw;
+  /* cr3 stays 0 from NewSystem; DeepCopyPageTables will populate it */
+  return child;
+}
+
+/* B4: Deep-copy parent page tables into child System.
+ * Writable private pages (PAGE_HOST|PAGE_RW) get fresh host copies.
+ * Read-only and non-host pages share the same host backing.
+ * Allocates child cr3 and all intermediate page-table levels. */
+static int DeepCopyPageTablesLevel(struct System *child,
+                                   const struct System *parent,
+                                   u64 parent_pt, u64 child_pt,
+                                   unsigned level) {
+  u8 *parent_table, *child_table;
+  int i;
+  parent_table = GetPageAddress((struct System *)parent, parent_pt, level == 39);
+  child_table = GetPageAddress(child, child_pt, level == 39);
+  if (!parent_table || !child_table) return -1;
+  for (i = 0; i < 512; ++i) {
+    u64 pentry = Load64(parent_table + i * 8);
+    if (!(pentry & PAGE_V)) {
+      Store64(child_table + i * 8, 0);
+      continue;
+    }
+    if (level == 12) {
+      /* Leaf PTE */
+      if ((pentry & PAGE_HOST) && (pentry & PAGE_RW)) {
+        /* Writable private page: allocate new host page, copy contents */
+        u64 new_pte = AllocateAnonymousPage(child);
+        if (new_pte == (u64)-1) return -1;
+        u8 *src = FindHostPage(pentry);
+        u8 *dst = FindHostPage(new_pte);
+        if (!src || !dst) return -1;
+        memcpy(dst, src, 4096);
+        /* Preserve original flags except host address */
+        new_pte |= (pentry & ~(u64)PAGE_TA);
+        Store64(child_table + i * 8, new_pte);
+      } else {
+        /* Read-only, file-mapped, or non-host: share as-is */
+        Store64(child_table + i * 8, pentry);
+      }
+    } else {
+      /* Non-leaf: allocate new page table for child, recurse */
+      if (pentry & PAGE_PS) {
+        /* Huge page at non-leaf level: share as-is (rare in guest) */
+        Store64(child_table + i * 8, pentry);
+      } else {
+        u64 new_child_pt = AllocatePageTable(child);
+        if (new_child_pt == (u64)-1) return -1;
+        int rc = DeepCopyPageTablesLevel(child, parent,
+                                         pentry,
+                                         new_child_pt,
+                                         level - 9);
+        if (rc) return rc;
+        /* Reconstruct non-leaf PTE with new child table address, keep flags */
+        u64 new_entry = (new_child_pt & PAGE_TA) | (pentry & ~PAGE_TA);
+        Store64(child_table + i * 8, new_entry);
+      }
+    }
+  }
+  return 0;
+}
+
+int DeepCopyPageTables(struct System *child, const struct System *parent) {
+  u64 child_cr3;
+  int rc;
+  unassert(child && parent);
+  unassert(!child->cr3); /* must be fresh from CloneSystemForFork */
+  child_cr3 = AllocatePageTable(child);
+  if (child_cr3 == (u64)-1) return -1;
+  child->cr3 = child_cr3;
+  rc = DeepCopyPageTablesLevel(child, parent,
+                               parent->cr3, child_cr3, 39);
+  if (rc) {
+    /* Partial failure: FreeSystem will clean up via FreeHostPages */
+    return rc;
+  }
+  return 0;
+}
+
 struct Machine *NewMachine(struct System *system, struct Machine *parent) {
   _Static_assert(IS2POW(kMaxThreadIds), "");
   struct Machine *m;
   unassert(system);
-  unassert(!parent || system == parent->system);
+  /* B4: relaxed for fork — child Machine may have a different System than parent */
   if (posix_memalign((void **)&m, _Alignof(struct Machine), sizeof(*m))) {
     enomem();
     return 0;
