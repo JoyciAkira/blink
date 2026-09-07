@@ -31,7 +31,22 @@
 void AssertFailed(const char *file, int line, const char *msg) {
   _Thread_local static bool noreentry;
   _Thread_local static char bp[20000];
+  struct Machine *m = g_machine;
+  int lock_i = m ? m->pagelocks.i : -1;
+  int last_depth =
+      m && lock_i > 0 ? m->pagelocks.p[lock_i - 1].sysdepth : -1;
+  u64 last_page =
+      m && lock_i > 0 ? (u64)m->pagelocks.p[lock_i - 1].page : 0;
+  void *last_pslot =
+      m && lock_i > 0 ? (void *)m->pagelocks.p[lock_i - 1].pslot : 0;
   WriteErrorString("assertion failed\n");
+  ERRF("G12-ASSERT file=%s line=%d tid=%d msg=%s ip=%p sp=%p fault=%p "
+       "pagelocks_i=%d sysdepth=%d last_depth=%d nofault=%d insyscall=%d "
+       "last_page=%#llx last_pslot=%p",
+       file, line, m ? m->tid : -1, msg, m ? (void *)GetIp(m) : 0,
+       m ? (void *)m->sp : 0, m ? (void *)m->faultaddr : 0, lock_i,
+       m ? m->sysdepth : -1, last_depth, m ? m->nofault : -1,
+       m ? m->insyscall : -1, (unsigned long long)last_page, last_pslot);
   if (!noreentry) {
     noreentry = true;
     FLAG_nologstderr = false;

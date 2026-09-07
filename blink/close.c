@@ -27,6 +27,7 @@
 #include "blink/dll.h"
 #include "blink/errno.h"
 #include "blink/fds.h"
+#include "blink/fork-coalesce.h"
 #include "blink/log.h"
 #include "blink/machine.h"
 #include "blink/syscall.h"
@@ -63,6 +64,11 @@ static int FinishClose(struct Machine *m, int rc) {
 
 int SysClose(struct Machine *m, i32 fildes) {
   struct Fd *fd;
+#ifdef __wasm__
+  /* Fork-exec coalescing: record the child's close during the pending-fork
+   * window (applied in the child worker before execve). */
+  fork_coalesce_add_fd_action(WASM_SPAWN_FD_CLOSE, fildes, 0);
+#endif
   LOCK(&m->system->fds.lock);
   if ((fd = GetFd(&m->system->fds, fildes))) {
     dll_remove(&m->system->fds.list, &fd->elem);

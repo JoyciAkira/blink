@@ -175,6 +175,8 @@ struct PageLock {
   i64 page;
   u8 *pslot;
   int sysdepth;
+  u64 entry;      /* PTE value at RecordPageLock time (valid+locked) */
+  u64 rec_seq;    /* global RecordPageLock sequence id */
 };
 
 struct SmcQueue {
@@ -431,6 +433,7 @@ struct Machine {               //
   bool reserving;                        //
   bool insyscall;                        //
   bool nofault;                          //
+  bool g12_holds_serializer;             // [G12] released in OpSyscall epilogue
   bool canhalt;                          //
   bool metal;                            //
   bool interrupted;                      //
@@ -524,6 +527,9 @@ u8 *BeginStoreNp(struct Machine *, i64, size_t, void *[2], u8 *);
 int GetFileDescriptorLimit(struct System *);
 bool HasPageLock(const struct Machine *, i64) nosideeffect;
 void CollectPageLocks(struct Machine *);
+void G12CapturePagePath(struct System *, u64, bool);
+void G12NoteTargetMprotect(struct System *, u64, u64, int, int, bool);
+void G12NoteTargetUnmap(struct System *, u64, u64);
 u8 *LookupAddress(struct Machine *, i64);
 u8 *LookupAddress2(struct Machine *, i64, u64, u64);
 u8 *SpyAddress(struct Machine *, i64);

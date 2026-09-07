@@ -32,6 +32,8 @@
 #include "blink/dll.h"
 #include "blink/endian.h"
 #include "blink/flag.h"
+#include "blink/fork-coalesce.h"
+#include "blink/guest-process.h"
 #include "blink/jit.h"
 #include "blink/loader.h"
 #include "blink/log.h"
@@ -150,6 +152,19 @@ void TerminateSignal(struct Machine *m, int sig, int code) {
   int syssig;
   struct sigaction sa;
   unassert(!IsSignalIgnoredByDefault(sig));
+  ERRF("G12-INITIAL-SIGNAL sig=%s code=%d rip=%#" PRIx64 " faultaddr=%#" PRIx64 " tid=%d",
+       DescribeSignal(sig), code, m ? m->ip : 0, m ? m->faultaddr : 0, m ? m->tid : -1);
+#ifdef __wasm__
+  /* N0D: leftover CLONE_THREAD worker taking a fatal guest signal must not
+   * KillOtherThreads the leader or kill(getpid()). SysExit clears ctid. */
+  if (m && m->tid != m->system->pid && !IsOrphan(m)) {
+    ERRF("G12-SIGILL-INST: %s", DescribeOp(m, m->ip));
+    ERRF("G12-TERMSIG-DEMOTE tid=%d sig=%s -> SysExit; wake parent", m->tid,
+         DescribeSignal(sig));
+    fork_coalesce_wake_parent();
+    SysExit(m, 0);
+  }
+#endif
   KillOtherThreads(m->system);
 #ifdef HAVE_JIT
   DisableJit(&m->system->jit);  // unmapping exec pages is slow
@@ -160,6 +175,7 @@ void TerminateSignal(struct Machine *m, int sig, int code) {
          "code=%d "
          "faultaddr=%#" PRIx64 ")",
          DescribeSignal(sig), m->ip, code, m->faultaddr);
+    ERRF("G12-SIGILL-INST: %s", DescribeOp(m, m->ip));
     PrintDiagnostics(m);
   }
   if ((syssig = XlatSignal(sig)) == -1) syssig = SIGKILL;
@@ -214,6 +230,10 @@ static int Exec(char *execfn, char *prog, char **argv, char **envp) {
   m->system->exec = Exec;
   if (!old) {
     // this is the first time a program is being loaded
+    guest_proc_init_first(m, 1);
+    unassert(g_process_table.current != NULL);
+    unassert(g_process_table.current->machine == m);
+    unassert(g_process_table.current->pid == 1);
     LoadProgram(m, execfn, prog, argv, envp, NULL);
     SetupCod(m);
     for (i = 0; i < 10; ++i) {
@@ -224,6 +244,9 @@ static int Exec(char *execfn, char *prog, char **argv, char **envp) {
 #ifdef HAVE_JIT
     DisableJit(&old->system->jit);  // unmapping exec pages is slow
 #endif
+    if (g_process_table.current) {
+      g_process_table.current->machine = m;
+    }
     unassert(!m->sysdepth);
     unassert(!m->pagelocks.i);
     unassert(!FreeVirtual(old->system, -0x800000000000, 0x1000000000000));

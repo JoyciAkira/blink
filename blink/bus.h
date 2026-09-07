@@ -19,8 +19,8 @@ struct Futex {
   i64 addr;
   int waiters;
   struct Dll elem;
-  pthread_cond_t_ cond;
-  pthread_mutex_t_ lock;
+  _Alignas(8) pthread_cond_t_ cond;
+  _Alignas(8) pthread_mutex_t_ lock;
 };
 
 struct Futexes {
@@ -72,6 +72,10 @@ u64 LoadPte32_(const u8 *) nosideeffect;
 bool CasPte32_(u8 *, u64, u64);
 void StorePte32_(u8 *, u64);
 
+/* M115-D2.1: telemetry hook (no semantic change). Defined in memory.c. */
+void G12NotePteWrite(void *, u64, u64, u8, u8);
+extern pthread_mutex_t_ g_g12_serialize_lock;
+
 nosideeffect static inline u64 LoadPte(const u8 *pte) {
 #if CAN_64BIT
   return Little64(
@@ -83,6 +87,7 @@ nosideeffect static inline u64 LoadPte(const u8 *pte) {
 
 static inline void StorePte(u8 *pte, u64 val) {
 #if CAN_64BIT
+  G12NotePteWrite(pte, 0, val, 2, 1);
   atomic_store_explicit((_Atomic(u64) *)pte, Little64(val),
                         memory_order_release);
 #else
@@ -92,10 +97,13 @@ static inline void StorePte(u8 *pte, u64 val) {
 
 static inline bool CasPte(u8 *pte, u64 oldval, u64 newval) {
 #if CAN_64BIT
+  bool ok__;
   oldval = Little64(oldval);
-  return atomic_compare_exchange_strong_explicit(
+  ok__ = atomic_compare_exchange_strong_explicit(
       (_Atomic(u64) *)pte, &oldval, Little64(newval),  //
       memory_order_release, memory_order_relaxed);
+  G12NotePteWrite(pte, oldval, ok__ ? newval : oldval, 1, ok__);
+  return ok__;
 #else
   return CasPte32_(pte, oldval, newval);
 #endif

@@ -46,9 +46,11 @@
 struct Allocator {
   pthread_mutex_t_ lock;
   struct HostPage *pages GUARDED_BY(lock);
+  struct HostPage *recycled GUARDED_BY(lock);
 } g_allocator = {
     PTHREAD_MUTEX_INITIALIZER_,
 };
+#define G12_HOSTPAGE_CAPACITY (1u << 20)
 
 struct Machine g_bssmachine;
 struct HostPages g_hostpages;
@@ -61,12 +63,29 @@ static void ClearPage(void *p) {
   FillPage(p, 0);
 }
 
-static struct HostPage *NewHostPage(void) {
+
+static struct HostPage *NewHostPageUnlocked(void) {
+  struct HostPage *h;
+  if ((h = g_allocator.recycled)) {
+    g_allocator.recycled = h->next;
+    return h;
+  }
   return (struct HostPage *)malloc(sizeof(struct HostPage));
 }
 
-static void FreeHostPage(struct HostPage *hp) {
-  free(hp);
+static struct HostPage *NewHostPage(void) {
+  struct HostPage *h;
+  LOCK(&g_allocator.lock);
+  h = NewHostPageUnlocked();
+  UNLOCK(&g_allocator.lock);
+  return h;
+}
+
+static void RecycleHostPage(struct HostPage *hp) {
+  LOCK(&g_allocator.lock);
+  hp->next = g_allocator.recycled;
+  g_allocator.recycled = hp;
+  UNLOCK(&g_allocator.lock);
 }
 
 static u64 TrackHostPage(u8 *ptr) {
@@ -74,14 +93,16 @@ static u64 TrackHostPage(u8 *ptr) {
   if (HasLinearMapping()) {
     return (uintptr_t)ptr;
   } else {
-    if (g_hostpages.n == g_hostpages.c) {
-      g_hostpages.c += 1;
-      g_hostpages.c += g_hostpages.c >> 1;
-      g_hostpages.p =
-          realloc(g_hostpages.p, g_hostpages.c * sizeof(*g_hostpages.p));
+    LOCK(&g_allocator.lock);
+    if (!g_hostpages.c) {
+      g_hostpages.c = G12_HOSTPAGE_CAPACITY;
+      unassert(g_hostpages.p = (u8 **)calloc(
+                   g_hostpages.c, sizeof(*g_hostpages.p)));
     }
+    unassert(g_hostpages.n < g_hostpages.c);
     entry = g_hostpages.n++;
     g_hostpages.p[entry] = ptr;
+    UNLOCK(&g_allocator.lock);
     return entry << 12;
   }
 }
@@ -119,7 +140,6 @@ void *AllocateBig(size_t n, int prot, int flags, int fd, off_t off) {
   void *p = Mmap(0, n, prot, flags, fd, off, "big");
   return p != MAP_FAILED ? p : 0;
 }
-
 static void FreePageTable(struct System *s, u8 *page) {
   FreeAnonymousPage(s, page);
   s->memstat.tables -= 1;
@@ -150,6 +170,17 @@ static bool FreeEmptyPageTables(struct System *s, u64 pt, long level) {
     }
   }
   if (isempty) {
+    /* G12-D4: detect freeing a page-table page that still holds a PAGE_LOCK
+     * — a syscall pins a pslot inside mi while this frees mi; the recycled
+     * page silently loses the lock bit. */
+    for (long j = 0; j < 512; ++j) {
+      u64 e2 = LoadPte(mi + j * 8);
+      if (e2 & PAGE_LOCKS) {
+        ERRF("M115-FREEPT mi=%p slot=%ld entry=%#llx locks=%d",
+             (void *)mi, j, (unsigned long long)e2,
+             (int)((e2 & PAGE_LOCKS) / PAGE_LOCK));
+      }
+    }
     FreePageTable(s, mi);
   }
   return isempty;
@@ -457,7 +488,7 @@ u64 AllocateAnonymousPage(struct System *s) {
     g_allocator.pages = h->next;
     UNLOCK(&g_allocator.lock);
     page = h->page;
-    FreeHostPage(h);
+    RecycleHostPage(h);
     goto Finished;
   } else {
     UNLOCK(&g_allocator.lock);
@@ -468,7 +499,7 @@ u64 AllocateAnonymousPage(struct System *s) {
   if (!page) return -1;
   LOCK(&g_allocator.lock);
   for (i = n; i-- > 1;) {
-    unassert((h = NewHostPage()));
+    unassert((h = NewHostPageUnlocked()));
     h->page = page + i * 4096;
     h->next = g_allocator.pages;
     g_allocator.pages = h;
@@ -484,7 +515,6 @@ Finished:
 u64 AllocatePageTable(struct System *s) {
   u64 res;
   if ((res = AllocateAnonymousPage(s)) != -1) {
-    s->memstat.tables += 1;
     res &= ~PAGE_U;
   }
   return res;
@@ -639,7 +669,14 @@ static bool FreePage(struct System *s, i64 virt, u64 entry, u64 size,
   if ((entry & (PAGE_HOST | PAGE_MAP | PAGE_MUG)) == PAGE_HOST) {
     unassert(~entry & PAGE_RSRV);
     s->memstat.committed -= 1;
-    ClearPage((page = FindHostPage(entry)));
+    u8 *hp = FindHostPage(entry);
+    if (entry & PAGE_LOCKS) {
+      ERRF("M115-CLEARLOCK page=%p entry=%#llx locks=%d",
+           (void *)hp, (unsigned long long)entry,
+           (int)((entry & PAGE_LOCKS) / PAGE_LOCK));
+    }
+    ClearPage(hp);
+    page = hp;
     FreeAnonymousPage(s, page);
     --*rss_delta;
     return false;
@@ -703,6 +740,7 @@ static void RemoveVirtual(struct System *s, i64 virt, i64 size,
   u8 *pp, *pde;
   unsigned pi, p1;
   unassert(!(virt & 4095));
+  G12NoteTargetUnmap(s, (u64)virt, (u64)size);
   MEM_LOGF("RemoveVirtual(%#" PRIx64 ", %#" PRIx64 ")", virt, size);
   for (pde = 0, end = virt + size; virt < end; virt += (u64)1 << i) {
     for (pt = s->cr3, i = 39;; i -= 9) {
@@ -1007,6 +1045,7 @@ i64 ReserveVirtual(struct System *s, i64 virt, i64 size, u64 flags, int fd,
             unassert(pt & PAGE_V);
             WaitForPageToNotBeLocked(s, virt, mi);
           } else if (CasPte(mi, pt, entry)) {
+            G12CapturePagePath(s, (u64)virt, true);
             break;
           }
         }
@@ -1196,6 +1235,8 @@ int ProtectVirtual(struct System *s, i64 virt, i64 size, int prot,
     unassert(!hostonly);  // caller should know better
     sysprot = PROT_READ | PROT_WRITE;
   }
+  G12NoteTargetMprotect(s, (u64)orig_virt, (u64)size, prot, sysprot,
+                        hostonly);
   memset(&ranges, 0, sizeof(ranges));
   executable_code_was_made_non_executable = false;
   for (rc = 0, end = virt + size;;) {
@@ -1230,7 +1271,9 @@ int ProtectVirtual(struct System *s, i64 virt, i64 size, int prot,
         if (!hostonly) {
           for (;;) {
             pt2 = (pt & ~(PAGE_U | PAGE_RW | PAGE_XD)) | key;
-            if (CasPte(mi, pt, pt2)) break;
+            if (CasPte(mi, pt, pt2)) {
+              break;
+            }
             pt = LoadPte(mi);
             if (!(pt & PAGE_V)) {
               goto MemoryDisappeared;

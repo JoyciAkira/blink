@@ -61,6 +61,7 @@
 #include "blink/endian.h"
 #include "blink/errno.h"
 #include "blink/flag.h"
+#include "blink/fork-coalesce.h"
 #include "blink/iovs.h"
 #include "blink/limits.h"
 #include "blink/linux.h"
@@ -477,18 +478,22 @@ static int Fork(struct Machine *m, u64 flags, u64 stack, u64 ctid) {
 }
 
 static int SysFork(struct Machine *m) {
+#if defined(HAVE_FORK)
   return Fork(m, 0, 0, 0);
+#elif defined(__wasm__)
+  return fork_coalesce_begin(m);
+#else
+  return enosys();
+#endif
 }
 
 static int SysVfork(struct Machine *m) {
-  // TODO: Parent should be stopped while child is running.
   return SysFork(m);
 }
 
 static void *OnSpawn(void *arg) {
   int rc;
   struct Machine *m = (struct Machine *)arg;
-  THR_LOGF("pid=%d tid=%d OnSpawn", m->system->pid, m->tid);
   m->thread = pthread_self();
   if (!(rc = sigsetjmp(m->onhalt, 1))) {
     m->canhalt = true;
@@ -598,8 +603,16 @@ static int SysClone(struct Machine *m, u64 flags, u64 stack, u64 ptid, u64 ctid,
 #ifdef HAVE_FORK
     return Fork(m, flags, stack, ctid);
 #else
+#ifdef __wasm__
+    /* Fork-exec coalescing: return 0 (child branch) so libuv's
+     * uv__process_child_init runs, recording fd actions; the real child is
+     * spawned at execve via the kernel's fn-based clone. */
+    ERRF("FORK-COALESCE: SysClone flags=%#lx", flags);
+    return fork_coalesce_begin(m);
+#else
     LOGF("forking support disabled");
     return enosys();
+#endif
 #endif
   }
 #ifdef HAVE_THREADS
@@ -1348,6 +1361,11 @@ static int Dup3(struct Machine *m, int fildes, int newfildes, int flags) {
 static int SysDup2(struct Machine *m, i32 fildes, i32 newfildes) {
   int rc, oflags;
   struct Fd *fd;
+#ifdef __wasm__
+  /* Fork-exec coalescing: record the child's dup2 during the pending-fork
+   * window instead of applying it to the (shared) parent fd table. */
+  fork_coalesce_add_fd_action(WASM_SPAWN_FD_DUP2, fildes, newfildes);
+#endif
   if (newfildes < 0) {
     LOGF("dup2() ebadf");
     return ebadf();
@@ -1381,6 +1399,9 @@ static int SysDup3(struct Machine *m, i32 fildes, i32 newfildes, i32 flags) {
   int rc;
   int oflags;
   struct Fd *fd;
+#ifdef __wasm__
+  fork_coalesce_add_fd_action(WASM_SPAWN_FD_DUP3, fildes, newfildes);
+#endif
   if (newfildes < 0) return ebadf();
   if (fildes == newfildes) return einval();
   if (flags & ~O_CLOEXEC_LINUX) return einval();
@@ -3561,6 +3582,19 @@ static int SysExecve(struct Machine *m, i64 pa, i64 aa, i64 ea) {
   if (!(prog = CopyStr(m, pa))) return -1;
   if (!(argv = CopyStrList(m, aa))) return -1;
   if (!(envp = CopyStrList(m, ea))) return -1;
+#ifdef __wasm__
+  /* Fork-exec coalescing: if a fork is pending, this execve is the child's.
+   * Trigger the kernel fn-based clone (spawn_exec_entry applies recorded fd
+   * actions + execve), then rewind the machine to the fork-return point with
+   * the real pid in rax so the guest's parent path resumes. */
+  if (g_fork_state.pending) {
+    ERRF("FORK-COALESCE: SysExecve intercept prog=%s", prog);
+    int rc = fork_coalesce_exec(m, prog, argv, envp);
+    if (rc == 0)
+      return 0; /* machine rewound; parent path resumes — do not exec here */
+    fork_coalesce_abort();
+  }
+#endif
   LOCK(&m->system->exec_lock);
   ExecveBlink(m, prog, argv, envp);
   SYS_LOGF("execve(%s)", prog);
@@ -3577,6 +3611,12 @@ static int SysWait4(struct Machine *m, int pid, i64 opt_out_wstatus_addr,
   u8 gwstatusb[4];
   struct rusage hrusage;
   struct rusage_linux grusage;
+#ifdef __wasm__
+  /* Fork-exec coalescing: translate a fake pid (returned to a guest that
+   * captured it before the rewind) to the real kernel pid. After the rewind
+   * the guest holds the real pid, so this is normally a passthrough. */
+  pid = fork_coalesce_wait(pid);
+#endif
   if ((options = XlatWait(options)) == -1) return -1;
   if ((opt_out_wstatus_addr && !IsValidMemory(m, opt_out_wstatus_addr,
                                               sizeof(gwstatusb), PROT_WRITE)) ||
@@ -5513,6 +5553,19 @@ void OpSyscall(P) {
   if (!m->sysdepth++) {
     atomic_store_explicit(&m->invalidated, true, memory_order_relaxed);
   }
+#ifdef __wasm__
+  /* G12 discriminator v2: CROSS-MACHINE serializer. The -e -s mask blocks
+   * machines on a shared host pipe; emulate that with a global mutex held
+   * across each syscall when CLONE_VM siblings exist. If the canonical crash
+   * disappears, the race is cross-syscall-interleaving; if not, it lives
+   * between syscalls. */
+  if (m->system->jit.threaded && m->sysdepth == 1 &&
+      ax != 0x0CA /* futex: must not hold serializer while blocking */ &&
+      ax != 0x03B /* execve: virtio/block poll path must stay re-entrant */) {
+    LOCK(&g_g12_serialize_lock);
+    m->g12_holds_serializer = true;
+  }
+#endif
   // to make system calls simpler and safer, any temporary memory that's
   // allocated will be added to a free list to be collected later. since
   // OpSyscall() is potentially recursive when SA_RESTART signals happen
@@ -5659,14 +5712,12 @@ void OpSyscall(P) {
     SYSCALL(5, 0x036, "setsockopt", SysSetsockopt, STRACE_5);
     SYSCALL(5, 0x037, "getsockopt", SysGetsockopt, STRACE_5);
 #endif /* DISABLE_SOCKETS */
-#ifdef HAVE_FORK
     SYSCALL(0, 0x039, "fork", SysFork, STRACE_FORK);
 #ifndef DISABLE_NONPOSIX
     SYSCALL(0, 0x03A, "vfork", SysVfork, STRACE_VFORK);
 #endif
     SYSCALL(4, 0x03D, "wait4", SysWait4, STRACE_WAIT4);
     SYSCALL(2, 0x03E, "kill", SysKill, STRACE_KILL);
-#endif /* HAVE_FORK */
 #ifdef HAVE_THREADS
     SYSCALL(6, 0x0CA, "futex", SysFutex, STRACE_FUTEX);
 #endif
@@ -5770,5 +5821,10 @@ void OpSyscall(P) {
   CollectPageLocks(m);
   unassert(!m->pagelocks.i || m->sysdepth);
   CollectGarbage(m, mark);
-  m->insyscall = false;
+#ifdef __wasm__
+  if (m->g12_holds_serializer) {
+    m->g12_holds_serializer = false;
+    UNLOCK(&g_g12_serialize_lock);
+  }
+#endif
 }
