@@ -244,10 +244,10 @@ static int Exec(char *execfn, char *prog, char **argv, char **envp) {
 #ifdef HAVE_JIT
     DisableJit(&old->system->jit);  // unmapping exec pages is slow
 #endif
+    unassert(!m->sysdepth);
     if (g_process_table.current) {
       g_process_table.current->machine = m;
     }
-    unassert(!m->sysdepth);
     unassert(!m->pagelocks.i);
     unassert(!FreeVirtual(old->system, -0x800000000000, 0x1000000000000));
     for (i = 1; i <= 64; ++i) {

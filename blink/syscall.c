@@ -372,6 +372,57 @@ static void ClearChildTid(struct Machine *m) {
 #endif
 }
 
+#ifdef __wasm__
+/* Candidate B: intercept exit/exit_group for GuestProcess children.
+ * Returns true if handled as guest child exit (zombie + switch, caller
+ * must break, NOT fall through to host exit). Returns false if host
+ * exit path should proceed (sole process, init, or table uninitialized).
+ */
+static bool GuestProcTryExit(struct Machine *m, int rc) {
+  struct GuestProcess *proc = NULL;
+  struct GuestProcess *parent = NULL;
+  struct GuestProcess *nxt = NULL;
+  int i;
+
+  if (!g_process_table.initialized) return false;
+  if (g_process_table.count <= 1) return false;
+
+  if (g_process_table.current && g_process_table.current->machine == m) {
+    proc = g_process_table.current;
+  } else {
+    for (i = 0; i < MAX_GUEST_PROCESSES; i++) {
+      struct GuestProcess *p = &g_process_table.procs[i];
+      if (p->state != GUEST_PROC_FREE && p->state != GUEST_PROC_REAPED &&
+          p->machine == m) {
+        proc = p;
+        break;
+      }
+    }
+  }
+  if (!proc) return false;
+  if (proc->ppid == 0) return false;
+  parent = guest_proc_find(proc->ppid);
+  if (!parent) return false;
+
+  guest_proc_exit(proc, rc);
+
+  if (parent->state == GUEST_PROC_RUNNABLE && parent->machine) {
+    nxt = parent;
+  } else {
+    for (nxt = g_process_table.run_queue_head; nxt;
+         nxt = nxt->next_runnable) {
+      if (nxt != proc && nxt->state == GUEST_PROC_RUNNABLE && nxt->machine) {
+        break;
+      }
+    }
+    if (!nxt) nxt = parent;
+  }
+  g_process_table.current = nxt;
+  if (nxt && nxt->machine) g_machine = nxt->machine;
+  return true;
+}
+#endif
+
 _Noreturn void SysExitGroup(struct Machine *m, int rc) {
   THR_LOGF("pid=%d tid=%d SysExitGroup", m->system->pid, m->tid);
 #ifdef __wasm__
@@ -523,8 +574,7 @@ static int SysFork(struct Machine *m) {
 #if defined(HAVE_FORK)
   return Fork(m, 0, 0, 0);
 #elif defined(__wasm__)
-  /* Candidate B: real fork via GuestProcess when table initialized.
-   * Falls back to fork-coalesce for pre-init boot or allocation failure. */
+  /* Candidate B: real fork via GuestProcess when table initialized. */
   if (g_process_table.initialized) {
     pid_t child_pid = guest_proc_fork(m, 0);
     if (child_pid > 0) {
@@ -3948,6 +3998,108 @@ static int SysWait4(struct Machine *m, int pid, i64 opt_out_wstatus_addr,
    * the guest holds the real pid, so this is normally a passthrough. */
   pid = fork_coalesce_wait(pid);
 #endif
+#ifdef __wasm__
+  /* Candidate B: reap GuestProcess zombie children; block+switch when live
+   * children exist but none have exited. Falls through to kernel wait when
+   * this process has no GuestProcess children (fork-coalesce/kernel path). */
+  if (g_process_table.initialized) {
+    struct GuestProcess *self = NULL;
+    struct GuestProcess *zombie = NULL;
+    int i;
+    if (g_process_table.current && g_process_table.current->machine == m) {
+      self = g_process_table.current;
+    } else {
+      for (i = 0; i < MAX_GUEST_PROCESSES; i++) {
+        struct GuestProcess *p = &g_process_table.procs[i];
+        if (p->state != GUEST_PROC_FREE && p->state != GUEST_PROC_REAPED &&
+            p->machine == m) {
+          self = p;
+          break;
+        }
+      }
+    }
+    if (self && (pid > 0 || pid == -1)) {
+      bool has_any = false;
+      for (i = 0; i < MAX_GUEST_PROCESSES; i++) {
+        struct GuestProcess *p = &g_process_table.procs[i];
+        if (p != self && p->state != GUEST_PROC_FREE &&
+            p->state != GUEST_PROC_REAPED && p->ppid == self->pid &&
+            (pid == -1 || p->pid == pid)) {
+          has_any = true;
+          break;
+        }
+      }
+      if (has_any) {
+        struct GuestProcess *z;
+        m->interrupted = false;
+        zombie = NULL;
+        for (z = self->next_zombie; z; z = z->next_zombie) {
+          if (z->state == GUEST_PROC_ZOMBIE && (pid == -1 || z->pid == pid)) {
+            zombie = z;
+            break;
+          }
+        }
+        if (zombie) {
+          int exitcode = zombie->exit_status & 255;
+          pid_t cpid = zombie->pid;
+          guest_proc_reap(zombie);
+          if (opt_out_wstatus_addr) {
+            gwstatus = exitcode << 8;
+            Write32(gwstatusb, gwstatus);
+            CopyToUserWrite(m, opt_out_wstatus_addr, gwstatusb, sizeof(gwstatusb));
+          }
+          if (opt_out_rusage_addr) {
+            memset(&grusage, 0, sizeof(grusage));
+            CopyToUserWrite(m, opt_out_rusage_addr, &grusage, sizeof(grusage));
+          }
+          return cpid;
+        }
+        if (options & WNOHANG_LINUX) {
+          return 0;
+        }
+        {
+          bool has_live = false;
+          for (i = 0; i < MAX_GUEST_PROCESSES; i++) {
+            struct GuestProcess *p = &g_process_table.procs[i];
+            if (p != self && p->state != GUEST_PROC_FREE &&
+                p->state != GUEST_PROC_REAPED && p->state != GUEST_PROC_ZOMBIE &&
+                p->ppid == self->pid && (pid == -1 || p->pid == pid)) {
+              has_live = true;
+              break;
+            }
+          }
+          if (has_live) {
+            struct GuestProcess *nxt = NULL;
+            for (i = 0; i < MAX_GUEST_PROCESSES; i++) {
+              struct GuestProcess *p = &g_process_table.procs[i];
+              if (p != self && p->state == GUEST_PROC_RUNNABLE && p->machine &&
+                  p->ppid == self->pid) {
+                nxt = p;
+                break;
+              }
+            }
+            if (!nxt) {
+              for (nxt = g_process_table.run_queue_head; nxt;
+                   nxt = nxt->next_runnable) {
+                if (nxt != self && nxt->state == GUEST_PROC_RUNNABLE &&
+                    nxt->machine) {
+                  break;
+                }
+              }
+            }
+            if (nxt) {
+              m->ip -= m->oplen;
+              m->interrupted = true;
+              g_process_table.current = nxt;
+              g_machine = nxt->machine;
+              return 0;
+            }
+          }
+        }
+      }
+    }
+  }
+#endif
   if ((options = XlatWait(options)) == -1) return -1;
   if ((opt_out_wstatus_addr && !IsValidMemory(m, opt_out_wstatus_addr,
                                               sizeof(gwstatusb), PROT_WRITE)) ||
@@ -6192,10 +6344,20 @@ void OpSyscall(P) {
 #endif /* DISABLE_NONPOSIX */
     case 0x3C:
       SYS_LOGF("%s(%#" PRIx64 ")", "exit", di);
+#ifdef __wasm__
+      if (!GuestProcTryExit(m, (int)di)) SysExit(m, di);
+      break;
+#else
       SysExit(m, di);
+#endif
     case 0xE7:
       SYS_LOGF("%s(%#" PRIx64 ")", "exit_group", di);
+#ifdef __wasm__
+      if (!GuestProcTryExit(m, (int)di)) SysExitGroup(m, di);
+      break;
+#else
       SysExitGroup(m, di);
+#endif
     case 0x00F:
       SigRestore(m);
       m->interrupted = true;  // preevnt ax clobber

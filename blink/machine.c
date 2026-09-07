@@ -2247,6 +2247,14 @@ void Actor(struct Machine *mm) {
      * pthread_exit do not run with TLS tid=0 (wasm_user_call<0 / 139). */
     g_machine = mm;
     m = mm;
+    /* Candidate B: adopt GuestProcess switch requested inside syscalls. */
+    if (g_process_table.count > 1 && g_process_table.current &&
+        g_process_table.current->machine &&
+        g_process_table.current->machine != m &&
+        g_process_table.current->state == GUEST_PROC_RUNNABLE) {
+      m = g_process_table.current->machine;
+      g_machine = m;
+    }
 #ifdef __wasm__
     if (fork_coalesce_should_park(m)) {
       atomic_store_explicit(&m->g12_parked, true, memory_order_release);
@@ -2270,8 +2278,7 @@ void Actor(struct Machine *mm) {
 #endif
     if (!atomic_load_explicit(&m->attention, memory_order_acquire)) {
       ExecuteInstruction(m);
-      // B2 cooperative scheduler: decrement current process budget,
-      // round-robin to next RUNNABLE process on quantum expiry.
+      // B2 cooperative scheduler: decrement budget, round-robin on expiry.
       if (g_process_table.count > 1 && g_process_table.current &&
           g_process_table.current->machine == m &&
           g_process_table.current->state == GUEST_PROC_RUNNABLE) {

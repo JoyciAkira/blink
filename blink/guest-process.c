@@ -24,6 +24,7 @@
 #include "blink/assert.h"
 #include "blink/endian.h"
 #include "blink/machine.h"
+#include "blink/log.h"
 
 /* Global process table instance */
 struct GuestProcessTable g_process_table;
@@ -254,6 +255,7 @@ pid_t guest_proc_fork(struct Machine *parent_m, u64 child_stack) {
 
   child_proc = guest_proc_alloc(parent_proc->pid);
   if (!child_proc) {
+    ERRF("GUEST-FORK-FAIL parent=%d reason=alloc", parent_proc->pid);
     errno = EAGAIN;
     return -1;
   }
@@ -276,6 +278,7 @@ pid_t guest_proc_fork(struct Machine *parent_m, u64 child_stack) {
   Put64(child_m->ax, 0);
   child_m->ip += child_m->oplen;
 
+  ERRF("GUEST-FORK parent=%d -> child=%d", parent_proc->pid, child_proc->pid);
   if (guest_proc_attach_machine(child_proc, child_m) != 0) {
     proc_runq_remove(child_proc);
     child_proc->state = GUEST_PROC_FREE;
