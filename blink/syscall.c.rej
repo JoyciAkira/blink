@@ -1,0 +1,458 @@
+@@ -61,6 +61,7 @@
+ #include "blink/endian.h"
+ #include "blink/errno.h"
+ #include "blink/flag.h"
++#include "blink/fork-coalesce.h"
+ #include "blink/iovs.h"
+ #include "blink/limits.h"
+ #include "blink/linux.h"
+@@ -266,6 +267,13 @@
+ bool CheckInterrupt(struct Machine *m, bool restartable) {
+   bool res, restart;
+   int sig, delivered;
++  // A teardown request must escape interruptible host waits so Actor()
++  // can reach CheckForSignals() and perform cooperative worker exit.
++  if (m->killed) {
++    m->interrupted = true;
++    errno = EINTR;
++    return true;
++  }
+   // an actual i/o call just received EINTR from the kernel
+ HandleSomeMoreInterrupts:
+   // determine if there's any signals pending for our guest
+@@ -350,9 +358,63 @@
+ #endif
+ }
+ 
++/* G12 terminal process-group shutdown: record the authoritative group exit
++ * code exactly once. Every downstream exit path (group exit, thread exit,
++ * benign signal teardown) must consult this record so the OUTER process
++ * reports the guest leader's code (0 for G12) instead of a teardown
++ * SIGABRT/SIGKILL. On wasm one outer process hosts the whole group. */
++static int G12RecordGroupExit(struct Machine *m, int rc) {
++  struct System *s = m->system;
++  bool first = false;
++  if (!atomic_load_explicit(&s->group_exiting, memory_order_acquire)) {
++    if (!atomic_exchange_explicit(&s->group_exiting, true, memory_order_acq_rel)) {
++      s->exited = true;
++      s->exitcode = rc;
++      first = true;
++    }
++  }
++  return s->exitcode;
++}
++
+ _Noreturn void SysExitGroup(struct Machine *m, int rc) {
+-  THR_LOGF("pid=%d tid=%d SysExitGroup", m->system->pid, m->tid);
+   ClearChildTid(m);
++#ifdef __wasm__
++  rc = G12RecordGroupExit(m, rc);
++  /* G12 terminal process-group shutdown (wasm): one outer process hosts the
++   * whole guest group. KillOtherThreads() escalates to host pthread_kill
++   * (SIGSYS/SIGKILL) which on wasm can kill the whole outer process and poison
++   * the external status (134/137). Here we instead record the authoritative
++   * group exit code, cooperatively mark sibling machines for stop (they exit
++   * through their own SysExit path which propagates the recorded code), free
++   * the leader machine and return rc to the kernel so do_exit(rc) reports it
++   * to the reaper. No host SIGKILL, no race with sibling teardown. */
++  {
++    struct Dll *e;
++    LOCK(&m->system->machines_lock);
++    for (e = dll_first(m->system->machines); e;
++         e = dll_next(m->system->machines, e)) {
++      struct Machine *m2 = MACHINE_CONTAINER(e);
++      if (m2 != m) {
++        atomic_store_explicit(&m2->killed, true, memory_order_release);
++        atomic_store_explicit(&m2->attention, true, memory_order_release);
++      }
++    }
++    UNLOCK(&m->system->machines_lock);
++  }
++#ifdef HAVE_JIT
++  DisableJit(&m->system->jit);  // unmapping exec pages is slow
++#endif
++  FreeMachine(m);
++#ifdef HAVE_JIT
++  ShutdownJit();
++#endif
++#ifndef NDEBUG
++  if (FLAG_statistics) {
++    PrintStats();
++  }
++#endif
++  __wasm_user_exit(rc);
++#else
+   if (m->system->isfork) {
+ #ifndef NDEBUG
+     if (FLAG_statistics) {
+@@ -383,22 +445,34 @@
+ #endif
+     exit(rc);
+   }
++#endif
+ }
+ 
+ _Noreturn void SysExit(struct Machine *m, int rc) {
+ #ifdef HAVE_THREADS
+-  THR_LOGF("pid=%d tid=%d SysExit", m->system->pid, m->tid);
+   if (IsOrphan(m)) {
+     SysExitGroup(m, rc);
+   } else {
++#ifdef __wasm__
++    /* Propagate the authoritative group code once group shutdown started, so
++     * sibling threads that terminate after the leader do not override (or get
++     * poisoned into) a later signal status. */
++    if (atomic_load_explicit(&m->system->group_exiting, memory_order_acquire))
++      rc = m->system->exitcode;
++#endif
+     ClearChildTid(m);
+     FreeMachine(m);
++#ifdef __wasm__
++    __wasm_user_exit(rc);
++#else
+     pthread_exit(EXIT_SUCCESS);
++#endif
+   }
+ #else
+   SysExitGroup(m, rc);
+ #endif
+ }
++
+ 
+ static int Fork(struct Machine *m, u64 flags, u64 stack, u64 ctid) {
+   int pid, newpid = 0;
+@@ -477,18 +551,22 @@
+ }
+ 
+ static int SysFork(struct Machine *m) {
++#if defined(HAVE_FORK)
+   return Fork(m, 0, 0, 0);
++#elif defined(__wasm__)
++  return fork_coalesce_begin(m, 0);
++#else
++  return enosys();
++#endif
+ }
+ 
+ static int SysVfork(struct Machine *m) {
+-  // TODO: Parent should be stopped while child is running.
+   return SysFork(m);
+ }
+ 
+ static void *OnSpawn(void *arg) {
+   int rc;
+   struct Machine *m = (struct Machine *)arg;
+-  THR_LOGF("pid=%d tid=%d OnSpawn", m->system->pid, m->tid);
+   m->thread = pthread_self();
+   if (!(rc = sigsetjmp(m->onhalt, 1))) {
+     m->canhalt = true;
+@@ -598,8 +676,16 @@
+ #ifdef HAVE_FORK
+     return Fork(m, flags, stack, ctid);
+ #else
++#ifdef __wasm__
++    /* Fork-exec coalescing: return 0 (child branch) so libuv's
++     * uv__process_child_init runs, recording fd actions; the real child is
++     * spawned at execve via the kernel's fn-based clone. */
++    ERRF("FORK-COALESCE: SysClone flags=%#lx", flags);
++    return fork_coalesce_begin(m, stack);
++#else
+     LOGF("forking support disabled");
+     return enosys();
++#endif
+ #endif
+   }
+ #ifdef HAVE_THREADS
+@@ -1352,6 +1438,19 @@
+     LOGF("dup2() ebadf");
+     return ebadf();
+   }
++#ifdef __wasm__
++  if (g_fork_state.pending) {
++    LOCK(&m->system->fds.lock);
++    fd = GetFd(&m->system->fds, fildes);
++    UNLOCK(&m->system->fds.lock);
++    if (!fd) return ebadf();
++    if (fildes != newfildes) {
++      if (newfildes >= GetFileDescriptorLimit(m->system)) return ebadf();
++      fork_coalesce_add_fd_action(WASM_SPAWN_FD_DUP2, fildes, newfildes);
++    }
++    return newfildes;
++  }
++#endif
+   if (fildes == newfildes) {
+     // no-op system call, but still must validate
+     LOCK(&m->system->fds.lock);
+@@ -1385,6 +1484,16 @@
+   if (fildes == newfildes) return einval();
+   if (flags & ~O_CLOEXEC_LINUX) return einval();
+   if (newfildes >= GetFileDescriptorLimit(m->system)) return ebadf();
++#ifdef __wasm__
++  if (g_fork_state.pending) {
++    LOCK(&m->system->fds.lock);
++    fd = GetFd(&m->system->fds, fildes);
++    UNLOCK(&m->system->fds.lock);
++    if (!fd) return ebadf();
++    fork_coalesce_add_fd_action(WASM_SPAWN_FD_DUP3, fildes, newfildes);
++    return newfildes;
++  }
++#endif
+ #ifdef HAVE_DUP3
+   if ((rc = Dup3(m, fildes, newfildes, XlatOpenFlags(flags))) != -1) {
+ #else
+@@ -3544,7 +3653,10 @@
+       // point of no return
+       // prog/argv/envp are copied onto the freelist
+       m->sysdepth = 0;
++      m->insyscall = false; /* G12: new image must not inherit stale flag */
++      CollectPageLocksForce(m);
+       CollectPageLocks(m);
++
+       // TODO(jart): Prevent possibility of stack overflow.
+       SYS_LOGF("m->system->exec(%s)", prog);
+       SysCloseExec(m->system);
+@@ -3558,9 +3670,28 @@
+ 
+ static int SysExecve(struct Machine *m, i64 pa, i64 aa, i64 ea) {
+   char *prog, **argv, **envp;
++  ERRF("G12-EXECVE-ENTER pid=%d pa=%#llx aa=%#llx ea=%#llx",
++       m->tid, (unsigned long long)pa, (unsigned long long)aa,
++       (unsigned long long)ea);
+   if (!(prog = CopyStr(m, pa))) return -1;
++  ERRF("G12-EXECVE-PROG pid=%d prog=%s", m->tid, prog);
+   if (!(argv = CopyStrList(m, aa))) return -1;
++  ERRF("G12-EXECVE-ARGV pid=%d argv0=%s", m->tid, argv[0] ? argv[0] : "null");
+   if (!(envp = CopyStrList(m, ea))) return -1;
++  ERRF("G12-EXECVE-ENVP pid=%d", m->tid);
++#ifdef __wasm__
++  /* Fork-exec coalescing: if a fork is pending, this execve is the child's.
++   * Trigger the kernel fn-based clone (spawn_exec_entry applies recorded fd
++   * actions + execve), then rewind the machine to the fork-return point with
++   * the real pid in rax so the guest's parent path resumes. */
++  if (g_fork_state.pending) {
++    ERRF("FORK-COALESCE: SysExecve intercept prog=%s", prog);
++    int rc = fork_coalesce_exec(m, prog, argv, envp);
++    if (rc == 0)
++      return 0; /* machine rewound; parent path resumes — do not exec here */
++    fork_coalesce_abort();
++  }
++#endif
+   LOCK(&m->system->exec_lock);
+   ExecveBlink(m, prog, argv, envp);
+   SYS_LOGF("execve(%s)", prog);
+@@ -3577,6 +3708,12 @@
+   u8 gwstatusb[4];
+   struct rusage hrusage;
+   struct rusage_linux grusage;
++#ifdef __wasm__
++  /* Fork-exec coalescing: translate a fake pid (returned to a guest that
++   * captured it before the rewind) to the real kernel pid. After the rewind
++   * the guest holds the real pid, so this is normally a passthrough. */
++  pid = fork_coalesce_wait(pid);
++#endif
+   if ((options = XlatWait(options)) == -1) return -1;
+   if ((opt_out_wstatus_addr && !IsValidMemory(m, opt_out_wstatus_addr,
+                                               sizeof(gwstatusb), PROT_WRITE)) ||
+@@ -3584,6 +3721,29 @@
+        !IsValidMemory(m, opt_out_rusage_addr, sizeof(grusage), PROT_WRITE))) {
+     return -1;
+   }
++#ifdef __wasm__
++  /* G12 child-exit: once check_child reaped the kernel child, satisfy libuv's
++   * waitpid() directly from the stash so the child looks reaped to the guest
++   * and the close event fires. Handles pid-specific and wait-any reaps. */
++  if (fork_coalesce_child_done() &&
++      (pid == g_fork_state.real_pid || pid == -1 ||
++       (pid < -1 && pid == -g_fork_state.real_pid))) {
++    if (opt_out_wstatus_addr) {
++      u8 sbuf[4];
++      gwstatus = (i32)((((g_fork_state.child_status >> 8) & 0xff) << 8) |
++                       (g_fork_state.child_status & 0x7f));
++      Write32(sbuf, gwstatus);
++      CopyToUserWrite(m, opt_out_wstatus_addr, sbuf, sizeof(sbuf));
++    }
++    if (opt_out_rusage_addr) {
++      memset(&grusage, 0, sizeof(grusage));
++      CopyToUserWrite(m, opt_out_rusage_addr, &grusage, sizeof(grusage));
++    }
++    rc = g_fork_state.real_pid;
++    fork_coalesce_reap(g_fork_state.fake_pid);
++    return rc;
++  }
++#endif
+ #ifdef HAVE_WAIT4
+   RESTARTABLE(rc = wait4(pid, &wstatus, options, &hrusage));
+ #else
+@@ -4755,6 +4915,15 @@
+ 
+ static int SysPoll(struct Machine *m, i64 fdsaddr, u64 nfds, i32 timeout_ms) {
+   struct timespec deadline;
++#ifdef __wasm__
++  /* G12 child-exit: cap the host wait while a coalesced child is outstanding so
++   * the loop wakes frequently, runs fork_coalesce_check_child(), and the guest
++   * gets its SIGCHLD + waitpid result promptly. */
++  if (fork_coalesce_unreaped_child()) {
++    if (timeout_ms < 0 || timeout_ms > 16) timeout_ms = 16;
++  }
++  fork_coalesce_check_child(m);
++#endif
+   if (timeout_ms < 0) {
+     deadline = GetMaxTime();
+   } else {
+@@ -4891,6 +5060,12 @@
+     if (sig == SIGSTOP_LINUX || sig == SIGKILL_LINUX) {
+       return raise(XlatSignal(sig));
+     } else if (~m->sigmask & ((u64)1 << (sig - 1))) {
++      if (sig == 6) { /* SIGABRT self-raise origin */
++        char dbg[96];
++        int n = snprintf(dbg, sizeof(dbg), "G12-ABRT-SELF tid=%d rip=%llx\n",
++                         m->tid, (unsigned long long)m->ip);
++        write(2, dbg, n);
++      }
+       LOCK(&m->system->sig_lock);
+       switch (Read64(m->system->hands[sig - 1].handler)) {
+         case SIG_DFL_LINUX:
+@@ -4984,6 +5159,35 @@
+   return getsid(pid);
+ }
+ 
++
++/* G12: node/libuv calls capget during bootstrap; ENOSYS made the caller spin
++ * forever (getpid→capget→getuid×4 loop). Return success with no capabilities:
++ * user_cap_hdr version 1 (LINUX_CAPABILITY_VERSION_1), 0 effective/inheritable
++ * caps, all 1 permitted bits cleared. */
++static int SysCapget(struct Machine *m, i64 hdraddr, i64 dataaddr) {
++  u8 *hdr;
++  if (!hdraddr)
++    return 0;
++  if (!(hdr = (u8 *)SchlepW(m, hdraddr, 8)))
++    return efault();
++  /* Accept any version the guest asks for; report V1 and zero caps.
++   * Real Linux versions are 0x19980330/V1, 0x19980331/V2, 0x20071026/V3 —
++   * our earlier check `version>1` rejected them all as EINVAL, leaving the
++   * caller spinning. */
++  /* Linux capability versions: V1=0x19980330, V2=0x19980331, V3=0x20071026.
++   * Echo back the requested version so the caller doesn't retry. */
++  u32 req_version = Read32(hdr);
++  Write32(hdr, req_version);
++  Write32(hdr + 4, 0);
++  if (dataaddr) {
++    u8 *data;
++    if (!(data = (u8 *)SchlepW(m, dataaddr, 12)))
++      return efault();
++    memset(data, 0, 12); /* effective, permitted, inheritable */
++  }
++  return 0;
++}
++
+ static int SysGetpid(struct Machine *m) {
+   return m->system->pid;
+ }
+@@ -5451,6 +5655,12 @@
+                          i32 maxevents, i32 timeout, i64 sigmaskaddr,
+                          u64 sigsetsize) {
+   struct timespec deadline;
++#ifdef __wasm__
++  if (fork_coalesce_unreaped_child()) {
++    if (timeout < 0 || timeout > 16) timeout = 16;
++  }
++  fork_coalesce_check_child(m);
++#endif
+   if (timeout >= 0) {
+     deadline = AddTime(GetTime(), FromMilliseconds(timeout));
+   } else {
+@@ -5464,6 +5674,10 @@
+                           i32 maxevents, i64 timeoutaddr, i64 sigmaskaddr,
+                           u64 sigsetsize) {
+   struct timespec ts, deadline;
++#ifdef __wasm__
++  if (fork_coalesce_unreaped_child())
++    fork_coalesce_check_child(m);
++#endif
+   if (timeoutaddr) {
+     if (LoadTimespecR(m, timeoutaddr, &ts) == -1) return -1;
+     deadline = AddTime(GetTime(), ts);
+@@ -5513,6 +5727,19 @@
+   if (!m->sysdepth++) {
+     atomic_store_explicit(&m->invalidated, true, memory_order_relaxed);
+   }
++#ifdef __wasm__
++  /* G12 discriminator v2: CROSS-MACHINE serializer. The -e -s mask blocks
++   * machines on a shared host pipe; emulate that with a global mutex held
++   * across each syscall when CLONE_VM siblings exist. If the canonical crash
++   * disappears, the race is cross-syscall-interleaving; if not, it lives
++   * between syscalls. */
++  if (m->system->jit.threaded && m->sysdepth == 1 &&
++      ax != 0x0CA /* futex: must not hold serializer while blocking */ &&
++      ax != 0x03B /* execve: virtio/block poll path must stay re-entrant */) {
++    LOCK(&g_g12_serialize_lock);
++    m->g12_holds_serializer = true;
++  }
++#endif
+   // to make system calls simpler and safer, any temporary memory that's
+   // allocated will be added to a free list to be collected later. since
+   // OpSyscall() is potentially recursive when SA_RESTART signals happen
+@@ -5526,6 +5753,10 @@
+   r0 = Get64(m->r10);
+   r8 = Get64(m->r8);
+   r9 = Get64(m->r9);
++  if (g_fork_state.pending)
++    ERRF("G12-PENDING-SYSCALL-IN tid=%d nr=%#llx di=%#llx si=%#llx dx=%#llx", m->tid,
++         (unsigned long long)ax, (unsigned long long)di,
++         (unsigned long long)si, (unsigned long long)dx);
+   switch (ax & 0xfff) {
+     SYSCALL(3, 0x000, "read", SysRead, STRACE_READ);
+     SYSCALL(3, 0x001, "write", SysWrite, STRACE_WRITE);
+@@ -5576,8 +5807,6 @@
+     SYSCALL(1, 0x051, "fchdir", SysFchdir, STRACE_FCHOWN);
+     SYSCALL(2, 0x052, "rename", SysRename, STRACE_RENAME);
+     SYSCALL(2, 0x053, "mkdir", SysMkdir, STRACE_MKDIR);
+-    SYSCALL(1, 0x054, "rmdir", SysRmdir, STRACE_RMDIR);
+-    SYSCALL(2, 0x055, "creat", SysCreat, STRACE_CREAT);
+     SYSCALL(2, 0x056, "link", SysLink, STRACE_LINK);
+     SYSCALL(1, 0x057, "unlink", SysUnlink, STRACE_UNLINK);
+     SYSCALL(2, 0x058, "symlink", SysSymlink, STRACE_SYMLINK);
+@@ -5598,6 +5827,7 @@
+     SYSCALL(2, 0x073, "getgroups", SysGetgroups, STRACE_2);
+     SYSCALL(1, 0x079, "getpgid", SysGetpgid, STRACE_GETPGID);
+     SYSCALL(1, 0x07C, "getsid", SysGetsid, STRACE_1);
++    SYSCALL(2, 0x07D, "capget", SysCapget, STRACE_2);
+     SYSCALL(1, 0x07F, "rt_sigpending", SysSigpending, STRACE_1);
+     SYSCALL(2, 0x089, "statfs", SysStatfs, STRACE_2);
+     SYSCALL(2, 0x08A, "fstatfs", SysFstatfs, STRACE_2);
+@@ -5659,14 +5889,12 @@
+     SYSCALL(5, 0x036, "setsockopt", SysSetsockopt, STRACE_5);
+     SYSCALL(5, 0x037, "getsockopt", SysGetsockopt, STRACE_5);
+ #endif /* DISABLE_SOCKETS */
+-#ifdef HAVE_FORK
+     SYSCALL(0, 0x039, "fork", SysFork, STRACE_FORK);
+ #ifndef DISABLE_NONPOSIX
+     SYSCALL(0, 0x03A, "vfork", SysVfork, STRACE_VFORK);
+ #endif
+     SYSCALL(4, 0x03D, "wait4", SysWait4, STRACE_WAIT4);
+     SYSCALL(2, 0x03E, "kill", SysKill, STRACE_KILL);
+-#endif /* HAVE_FORK */
+ #ifdef HAVE_THREADS
+     SYSCALL(6, 0x0CA, "futex", SysFutex, STRACE_FUTEX);
+ #endif
+@@ -5768,7 +5996,19 @@
+   }
+   unassert(--m->sysdepth >= 0);
+   CollectPageLocks(m);
+-  unassert(!m->pagelocks.i || m->sysdepth);
++  if (m->sysdepth == 0 && m->pagelocks.i) {
++    /* G12: in-process exec (ExecveBlink) resets sysdepth to 0 mid-syscall;
++     * page pins taken while loading the new image record at depth 0 and can
++     * never be collected by the depth>0 rule. At a depth-0 epilogue ANY
++     * remaining locks are stale by definition — release them. */
++    CollectPageLocksForce(m);
++  }
+   CollectGarbage(m, mark);
++#ifdef __wasm__
++  if (m->g12_holds_serializer) {
++    m->g12_holds_serializer = false;
++    UNLOCK(&g_g12_serialize_lock);
++  }
++#endif
+   m->insyscall = false;
+ }

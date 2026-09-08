@@ -38,6 +38,7 @@ struct Fd {
   pthread_mutex_t_ lock;
   const struct FdCb *cb;
   char *path;
+  void *guest_data;  /* B7: guest-side pipe/socket data (not freed by FreeFd) */
   int *ofd_refcount;  // B6: shared refcount for open file description
   union {
     struct sockaddr sa;
@@ -57,6 +58,7 @@ void AddStdFd(struct Fds *, int);
 void CloneFds(struct Fds *child, struct Fds *parent);
 struct Fd *AddFd(struct Fds *, int, int);
 struct Fd *ForkFd(struct Fds *, struct Fd *, int, int);
+struct Fd *AddFdAuto(struct Fds *, int);
 struct Fd *GetFd(struct Fds *, int);
 void LockFd(struct Fd *);
 void UnlockFd(struct Fd *);

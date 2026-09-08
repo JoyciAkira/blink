@@ -33,7 +33,7 @@
 #include "blink/syscall.h"
 #include "blink/thread.h"
 #include "blink/vfs.h"
-#include "blink/xlat.h"
+#include "blink/guest-pipe.h"
 
 int SysPipe2(struct Machine *m, i64 pipefds_addr, i32 flags) {
   int rc;
@@ -51,6 +51,17 @@ int SysPipe2(struct Machine *m, i64 pipefds_addr, i32 flags) {
     return efault();
   }
   if (!(lim = GetFileDescriptorLimit(m->system))) return emfile();
+#ifdef __wasm__
+  /* B7: Guest-side pipe for wasm32 avoids host pipe() trap.
+   * GuestPipeCreate allocates fds and adds them to system->fds. */
+  if ((rc = GuestPipeCreate(m->system, fds)) == 0) {
+    Write32(fds_linux[0], fds[0]);
+    Write32(fds_linux[1], fds[1]);
+    unassert(!CopyToUserWrite(m, pipefds_addr, fds_linux, sizeof(fds_linux)));
+    return 0;
+  }
+  return rc;
+#else
 #ifdef HAVE_PIPE2
   if ((rc = VfsPipe2(fds, (oflags = XlatOpenFlags(flags)))) != -1) {
 #else
@@ -89,4 +100,5 @@ int SysPipe2(struct Machine *m, i64 pipefds_addr, i32 flags) {
   if (flags) UNLOCK(&m->system->exec_lock);
 #endif
   return rc;
+#endif /* __wasm__ */
 }

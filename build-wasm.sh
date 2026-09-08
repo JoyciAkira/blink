@@ -32,7 +32,7 @@ for f in blink/*.c; do
     #       oneoff.c (test binary),
     #       compress.c (needs zlib, only used by blinkenlights)
     case "$basename" in
-        demangle.c|blinkenlights.c|oneoff.c|compress.c|ioctl.c|cpucount.c|sysinfo.c)
+        demangle.c|blinkenlights.c|oneoff.c|compress.c|ioctl.c|cpucount.c|sysinfo.c|realpath.c)
             echo "  SKIP $f" >&2
             continue
             ;;

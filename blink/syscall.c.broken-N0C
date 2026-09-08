@@ -62,7 +62,6 @@
 #include "blink/errno.h"
 #include "blink/flag.h"
 #include "blink/fork-coalesce.h"
-#include "blink/guest-process.h"
 #include "blink/iovs.h"
 #include "blink/limits.h"
 #include "blink/linux.h"
@@ -85,689 +84,6 @@
 #include "blink/util.h"
 #include "blink/vfs.h"
 #include "blink/xlat.h"
-
-#ifdef __linux
-#include <sys/prctl.h>
-#endif
-
-#ifdef __EMSCRIPTEN__
-#include <emscripten.h>
-#endif
-
-#ifdef __HAIKU__
-#include <OS.h>
-#include <sys/sockio.h>
-#endif
-
-#ifdef HAVE_SCHED_H
-#include <sched.h>
-#endif
-
-#ifdef HAVE_EPOLL_PWAIT1
-#include <sys/epoll.h>
-#endif
-
-#ifdef HAVE_SYS_MOUNT_H
-#include <sys/mount.h>
-#endif
-
-#ifdef SO_LINGER_SEC
-#define SO_LINGER_ SO_LINGER_SEC
-#else
-#define SO_LINGER_ SO_LINGER
-#endif
-
-#define SYSARGS0
-#define SYSARGS1 , di
-#define SYSARGS2 , di, si
-#define SYSARGS3 , di, si, dx
-#define SYSARGS4 , di, si, dx, r0
-#define SYSARGS5 , di, si, dx, r0, r8
-#define SYSARGS6 , di, si, dx, r0, r8, r9
-
-#define SYSCALL(arity, ordinal, name, func, signature)            \
-  case ordinal:                                                   \
-    if (STRACE && FLAG_strace >= (signature)[0]) {                \
-      Strace(m, name, true, &(signature)[1] SYSARGS##arity);      \
-    }                                                             \
-    ax = func(m SYSARGS##arity);                                  \
-    if (STRACE && FLAG_strace) {                                  \
-      Strace(m, name, false, &(signature)[1], ax SYSARGS##arity); \
-    }                                                             \
-    break
-
-char *g_blink_path;
-bool FLAG_statistics;
-
-// delegate to work around function pointer errors, b/c
-// old musl toolchains using `int ioctl(int, int, ...)`
-static int SystemIoctl(int fd, unsigned long request, ...) {
-  va_list va;
-  uintptr_t arg;
-  va_start(va, request);
-  arg = va_arg(va, uintptr_t);
-  va_end(va);
-  return VfsIoctl(fd, request, (void *)arg);
-}
-
-#ifdef __EMSCRIPTEN__
-// If this runs on the main thread, the browser is blocked until we return
-// back to the main loop. Yield regularly when the process waits for some
-// user input.
-
-int em_poll(struct pollfd *fds, nfds_t nfds, int timeout) {
-  int ret = VfsPoll(fds, nfds, timeout);
-  if (ret == 0) emscripten_sleep(50);
-  return ret;
-}
-
-ssize_t em_readv(int fd, const struct iovec *iov, int iovcnt) {
-  // Handle blocking reads by waiting for POLLIN
-  if ((VfsFcntl(fd, F_GETFL, 0) & O_NONBLOCK) == 0) {
-    struct pollfd pfd;
-    pfd.fd = fd;
-    pfd.events = POLLIN;
-    while (em_poll(&pfd, 1, 50) == 0) {
-    }
-  }
-  size_t ret = VfsReadv(fd, iov, iovcnt);
-  if (ret == -1 && errno == EAGAIN) emscripten_sleep(50);
-  return ret;
-}
-#endif
-
-static int my_tcgetwinsize(int fd, struct winsize *ws) {
-  return VfsIoctl(fd, TIOCGWINSZ, (void *)ws);
-}
-
-static int my_tcsetwinsize(int fd, const struct winsize *ws) {
-  return VfsIoctl(fd, TIOCSWINSZ, (void *)ws);
-}
-
-const struct FdCb kFdCbHost = {
-    .close = VfsClose,
-#ifdef __EMSCRIPTEN__
-    .readv = em_readv,
-#else
-    .readv = VfsReadv,
-#endif
-    .writev = VfsWritev,
-#ifdef __EMSCRIPTEN__
-    .poll = em_poll,
-#else
-    .poll = VfsPoll,
-#endif
-    .tcgetattr = VfsTcgetattr,
-    .tcsetattr = VfsTcsetattr,
-    .tcgetwinsize = my_tcgetwinsize,
-    .tcsetwinsize = my_tcsetwinsize,
-};
-
-struct Fd *GetAndLockFd(struct Machine *m, int fildes) {
-  struct Fd *fd;
-  LOCK(&m->system->fds.lock);
-  if ((fd = GetFd(&m->system->fds, fildes))) LockFd(fd);
-  UNLOCK(&m->system->fds.lock);
-  return fd;
-}
-
-int GetDirFildes(int fildes) {
-  if (fildes == AT_FDCWD_LINUX) return AT_FDCWD;
-  return fildes;
-}
-
-const char *GetDirFildesPath(struct System *s, int fildes) {
-  struct Fd *fd;
-  if (fildes == AT_FDCWD_LINUX) return ".";
-  if ((fd = GetFd(&s->fds, fildes))) return fd->path;
-  return 0;
-}
-
-void SignalActor(struct Machine *m) {
-  for (;;) {
-    STATISTIC(++interps);
-    JitlessDispatch(DISPATCH_NOTHING);
-    if (atomic_load_explicit(&m->attention, memory_order_acquire)) {
-      if (m->restored) break;
-      CheckForSignals(m);
-    }
-  }
-}
-
-bool DeliverSignalRecursively(struct Machine *m, int sig) {
-  bool issigsuspend;
-  sigset_t unblock, oldmask;
-  SYS_LOGF("recursing %s", DescribeSignal(sig));
-  if (m->sigdepth >= kMaxSigDepth) {
-    LOGF("exceeded max signal depth");
-    return false;
-  }
-  // we're officially calling a signal handler
-  // run the signal handler code inside the i/o routine
-  // it's very important that no locks are currently held
-  // garbage may exist on the freelist for calls like sendmsg
-  ++m->sigdepth;
-  if ((issigsuspend = m->issigsuspend)) {
-    m->issigsuspend = false;
-    unassert(!sigemptyset(&unblock));
-    unassert(!pthread_sigmask(SIG_BLOCK, &unblock, &oldmask));
-  }
-  m->restored = false;
-  m->insyscall = false;
-  SignalActor(m);
-  m->insyscall = true;
-  m->restored = false;
-  if (issigsuspend) {
-    unassert(!pthread_sigmask(SIG_SETMASK, &oldmask, 0));
-    m->issigsuspend = true;
-  }
-  --m->sigdepth;
-  return true;
-}
-
-bool CheckInterrupt(struct Machine *m, bool restartable) {
-  bool res, restart;
-  int sig, delivered;
-#ifdef __wasm__
-  g_machine = m;
-  if (fork_coalesce_unreaped_child()) {
-    fork_coalesce_check_child(m);
-  }
-  if (fork_coalesce_should_park(m)) {
-    atomic_store_explicit(&m->g12_parked, true, memory_order_release);
-    m->interrupted = true;
-    errno = EINTR;
-    return true;
-  }
-  if (atomic_load_explicit(&m->killed, memory_order_acquire)) {
-    m->interrupted = true;
-    errno = EINTR;
-    return true;
-  }
-#endif
-  // an actual i/o call just received EINTR from the kernel
-HandleSomeMoreInterrupts:
-  // determine if there's any signals pending for our guest
-  Put64(m->ax, -EINTR_LINUX);
-  if ((sig = ConsumeSignal(m, &delivered, &restart))) {
-    TerminateSignal(m, sig, 0);
-  }
-  if (delivered) {
-    if (DeliverSignalRecursively(m, delivered)) {
-      if (restart && restartable) {
-        // try to consume some more signals while we're here
-        goto HandleSomeMoreInterrupts;
-      } else {
-        // let the i/o routine return eintr
-        errno = EINTR;
-        res = true;
-      }
-    } else {
-      errno = EINTR;
-      res = true;
-    }
-  } else {
-    // no signal is being delivered
-    res = false;
-  }
-  m->interrupted = res;
-  return res;
-}
-
-static struct Futex *FindFutex(struct Machine *m, i64 addr) {
-  struct Dll *e;
-  for (e = dll_first(g_bus->futexes.active); e;
-       e = dll_next(g_bus->futexes.active, e)) {
-    if (FUTEX_CONTAINER(e)->addr == addr) {
-      return FUTEX_CONTAINER(e);
-    }
-  }
-  return 0;
-}
-
-static int SysFutexWake(struct Machine *m, i64 uaddr, u32 count) {
-  int rc;
-  struct Futex *f;
-  if (!count) return 0;
-  LOCK(&g_bus->futexes.lock);
-  if ((f = FindFutex(m, uaddr))) {
-    LOCK(&f->lock);
-  }
-  UNLOCK(&g_bus->futexes.lock);
-  if (f && f->waiters) {
-    THR_LOGF("pid=%d tid=%d is waking %d waiters at address %#" PRIx64,
-             m->system->pid, m->tid, f->waiters, uaddr);
-    if (count == 1) {
-      unassert(!pthread_cond_signal(&f->cond));
-      rc = 1;
-    } else {
-      unassert(!pthread_cond_broadcast(&f->cond));
-      rc = f->waiters;
-    }
-    UNLOCK(&f->lock);
-  } else {
-    if (f) UNLOCK(&f->lock);
-    THR_LOGF("pid=%d tid=%d is waking no one at address %#" PRIx64,
-             m->system->pid, m->tid, uaddr);
-    rc = 0;
-  }
-  return rc;
-}
-
-static void ClearChildTid(struct Machine *m) {
-#if defined(HAVE_FORK) || defined(HAVE_THREADS)
-  _Atomic(int) *ctid;
-  if (m->ctid) {
-    THR_LOGF("ClearChildTid(%#" PRIx64 ")", m->ctid);
-    if ((ctid = (_Atomic(int) *)LookupAddress(m, m->ctid))) {
-      atomic_store_explicit(ctid, 0, memory_order_seq_cst);
-      ERRF("G12-CLEARTID-HIT tid=%d ctid=%#" PRIx64 " ptr=%p ok",
-           m->tid, m->ctid, (void *)ctid);
-    } else {
-      THR_LOGF("invalid clear child tid address %#" PRIx64, m->ctid);
-      ERRF("G12-CLEARTID-MISS tid=%d ctid=%#" PRIx64, m->tid, m->ctid);
-    }
-  }
-  SysFutexWake(m, m->ctid, INT_MAX);
-#endif
-}
-
-#ifdef __wasm__
-/* Candidate B: intercept exit/exit_group for GuestProcess children.
- * Returns true if handled as guest child exit (zombie + switch, caller
- * must break, NOT fall through to host exit). Returns false if host
- * exit path should proceed (sole process, init, or table uninitialized).
- */
-static bool GuestProcTryExit(struct Machine *m, int rc) {
-  struct GuestProcess *proc = NULL;
-  struct GuestProcess *parent = NULL;
-  struct GuestProcess *nxt = NULL;
-  int i;
-
-  if (!g_process_table.initialized) return false;
-  if (g_process_table.count <= 1) return false;
-
-  if (g_process_table.current && g_process_table.current->machine == m) {
-    proc = g_process_table.current;
-  } else {
-    for (i = 0; i < MAX_GUEST_PROCESSES; i++) {
-      struct GuestProcess *p = &g_process_table.procs[i];
-      if (p->state != GUEST_PROC_FREE && p->state != GUEST_PROC_REAPED &&
-          p->machine == m) {
-        proc = p;
-        break;
-      }
-    }
-  }
-  if (!proc) return false;
-  if (proc->ppid == 0) return false;
-  parent = guest_proc_find(proc->ppid);
-  if (!parent) return false;
-
-  guest_proc_exit(proc, rc);
-
-  if (parent->state == GUEST_PROC_RUNNABLE && parent->machine) {
-    nxt = parent;
-  } else {
-    for (nxt = g_process_table.run_queue_head; nxt;
-         nxt = nxt->next_runnable) {
-      if (nxt != proc && nxt->state == GUEST_PROC_RUNNABLE && nxt->machine) {
-        break;
-      }
-    }
-    if (!nxt) nxt = parent;
-  }
-  g_process_table.current = nxt;
-  if (nxt && nxt->machine) g_machine = nxt->machine;
-  return true;
-}
-#endif
-
-_Noreturn void SysExitGroup(struct Machine *m, int rc) {
-  THR_LOGF("pid=%d tid=%d SysExitGroup", m->system->pid, m->tid);
-#ifdef __wasm__
-  g_machine = m;
-  ERRF("G12-EXITGROUP tid=%d rc=%d ip=%#" PRIx64, m->tid, rc, m->ip);
-  /* N0D: leftover CLONE_THREAD worker exit_group must not KillOtherThreads
-   * the leader. Demote to thread exit (clears ctid, wakes joiner). */
-  if (m->tid != m->system->pid && !IsOrphan(m)) {
-    ERRF("G12-EXITGROUP-DEMOTE tid=%d rc=%d -> SysExit", m->tid, rc);
-    SysExit(m, rc);
-  }
-#endif
-  ClearChildTid(m);
-  if (m->system->isfork) {
-#ifndef NDEBUG
-    if (FLAG_statistics) {
-      PrintStats();
-    }
-#endif
-    THR_LOGF("calling _Exit(%d)", rc);
-    _Exit(rc);
-  } else {
-    THR_LOGF("calling exit(%d)", rc);
-    KillOtherThreads(m->system);
-#ifdef HAVE_JIT
-    DisableJit(&m->system->jit);  // unmapping exec pages is slow
-#endif
-    if (m->system->trapexit && !m->system->exited) {
-      m->system->exited = true;
-      m->system->exitcode = rc;
-      HaltMachine(m, kMachineExitTrap);
-    }
-#ifdef __wasm__
-    /* N0D: skip FreeSystem/atexit after leftover KOT. FreePage during
-     * FreeSystem trapped wasm_user_call<0 -> 139. Host _Exit maps to
-     * kernel do_exit(rc). */
-    ERRF("G12-EXITGROUP-_Exit tid=%d rc=%d", m->tid, rc);
-    _Exit(rc);
-#else
-    FreeMachine(m);
-#ifdef HAVE_JIT
-    ShutdownJit();
-#endif
-#ifndef NDEBUG
-    if (FLAG_statistics) {
-      PrintStats();
-    }
-#endif
-    exit(rc);
-#endif
-  }
-}
-
-_Noreturn void SysExit(struct Machine *m, int rc) {
-#ifdef HAVE_THREADS
-#ifdef __wasm__
-  g_machine = m;
-#endif
-  THR_LOGF("pid=%d tid=%d SysExit", m->system->pid, m->tid);
-  if (IsOrphan(m)) {
-    SysExitGroup(m, rc);
-  } else {
-    ClearChildTid(m);
-    FreeMachine(m);
-    pthread_exit(EXIT_SUCCESS);
-  }
-#else
-  SysExitGroup(m, rc);
-#endif
-}
-
-static int Fork(struct Machine *m, u64 flags, u64 stack, u64 ctid) {
-  int pid, newpid = 0;
-  _Atomic(int) *ctid_ptr;
-  unassert(!m->path.jb);
-  // NOTES ON THE LOCKING TOPOLOGY
-  // exec_lock must come before sig_lock (see dup3)
-  // exec_lock must come before fds.lock (see dup3)
-  // exec_lock must come before fds.lock (see execve)
-  // mmap_lock must come before fds.lock (see GetOflags)
-  // mmap_lock must come before pagelocks_lock (see FreePage)
-  if (m->threaded) {
-    LOCK(&m->system->exec_lock);
-    LOCK(&m->system->sig_lock);
-    LOCK(&m->system->mmap_lock);
-    LOCK(&m->system->pagelocks_lock);
-    LOCK(&m->system->fds.lock);
-    LOCK(&m->system->machines_lock);
-#ifndef HAVE_PTHREAD_PROCESS_SHARED
-    LOCK(&g_bus->futexes.lock);
-#endif
-#ifdef HAVE_JIT
-    LOCK(&m->system->jit.lock);
-#endif
-  }
-  pid = fork();
-#ifdef __HAIKU__
-  // haiku wipes tls after fork() in child
-  // https://dev.haiku-os.org/ticket/17896
-  if (!pid) g_machine = m;
-#endif
-  if (m->threaded) {
-#ifdef HAVE_JIT
-    UNLOCK(&m->system->jit.lock);
-#endif
-#ifndef HAVE_PTHREAD_PROCESS_SHARED
-    UNLOCK(&g_bus->futexes.lock);
-#endif
-    UNLOCK(&m->system->machines_lock);
-    UNLOCK(&m->system->fds.lock);
-    UNLOCK(&m->system->pagelocks_lock);
-    UNLOCK(&m->system->mmap_lock);
-    UNLOCK(&m->system->sig_lock);
-    UNLOCK(&m->system->exec_lock);
-  }
-  if (!pid) {
-    newpid = getpid();
-    if (stack) {
-      Put64(m->sp, stack);
-    }
-#ifndef HAVE_PTHREAD_PROCESS_SHARED
-    InitBus();
-#endif
-    THR_LOGF("pid=%d tid=%d SysFork -> pid=%d tid=%d",  //
-             m->system->pid, m->tid, newpid, newpid);
-    m->tid = m->system->pid = newpid;
-    m->system->isfork = true;
-    RemoveOtherThreads(m->system);
-#ifdef __CYGWIN__
-    // Cygwin doesn't seem to properly set the PROT_EXEC
-    // protection for JIT blocks after forking.
-    FixJitProtection(&m->system->jit);
-#endif
-    if ((flags & (CLONE_CHILD_SETTID_LINUX | CLONE_CHILD_CLEARTID_LINUX)) &&
-        !(ctid & (sizeof(i32) - 1)) &&
-        (ctid_ptr = (_Atomic(i32) *)LookupAddress(m, ctid))) {
-      if (flags & CLONE_CHILD_SETTID_LINUX) {
-        atomic_store_explicit(ctid_ptr, Little32(newpid), memory_order_release);
-      }
-      if (flags & CLONE_CHILD_CLEARTID_LINUX) {
-        m->ctid = ctid;
-      }
-    }
-  }
-  return pid;
-}
-
-static int SysFork(struct Machine *m) {
-#if defined(__wasm__)
-  /* Candidate B: real fork via GuestProcess when table initialized. */
-  if (g_process_table.initialized) {
-    pid_t child_pid = guest_proc_fork(m, 0);
-    if (child_pid > 0) {
-      return child_pid;
-    }
-  }
-  return fork_coalesce_begin(m, 0);
-#elif defined(HAVE_FORK)
-  return Fork(m, 0, 0, 0);
-#else
-  return enosys();
-#endif
-}
-
-static int SysVfork(struct Machine *m) {
-  return SysFork(m);
-}
-
-static void *OnSpawn(void *arg) {
-  int rc;
-  struct Machine *m = (struct Machine *)arg;
-  m->thread = pthread_self();
-  if (!(rc = sigsetjmp(m->onhalt, 1))) {
-    m->canhalt = true;
-    unassert(!pthread_sigmask(SIG_SETMASK, &m->spawn_sigmask, 0));
-  } else if (rc == kMachineFatalSystemSignal) {
-    HandleFatalSystemSignal(m, &g_siginfo);
-  }
-  Blink(m);
-}
-
-#ifdef HAVE_THREADS
-static int SysSpawn(struct Machine *m, u64 flags, u64 stack, u64 ptid, u64 ctid,
-                    u64 tls, u64 func) {
-  int tid;
-  int err;
-  int ignored;
-  pthread_t thread;
-  unsigned supported;
-  unsigned mandatory;
-  sigset_t ss, oldss;
-  pthread_attr_t attr;
-  _Atomic(int) *ptid_ptr;
-  _Atomic(int) *ctid_ptr;
-  struct Machine *m2 = 0;
-  THR_LOGF("pid=%d tid=%d SysSpawn", m->system->pid, m->tid);
-  if ((flags & 255) != 0 && (flags & 255) != SIGCHLD_LINUX) {
-    LOGF("unsupported clone() signal: %" PRId64, flags & 255);
-    return einval();
-  }
-  flags &= ~255;
-  supported = CLONE_THREAD_LINUX | CLONE_VM_LINUX | CLONE_FS_LINUX |
-              CLONE_FILES_LINUX | CLONE_SIGHAND_LINUX | CLONE_SETTLS_LINUX |
-              CLONE_PARENT_SETTID_LINUX | CLONE_CHILD_CLEARTID_LINUX |
-              CLONE_CHILD_SETTID_LINUX | CLONE_SYSVSEM_LINUX;
-  mandatory = CLONE_THREAD_LINUX | CLONE_VM_LINUX | CLONE_FS_LINUX |
-              CLONE_FILES_LINUX | CLONE_SIGHAND_LINUX;
-  ignored = CLONE_DETACHED_LINUX | CLONE_IO_LINUX;
-  flags &= ~ignored;
-  if (flags & ~supported) {
-    LOGF("unsupported clone() flags: %#" PRIx64, flags & ~supported);
-    return einval();
-  }
-  if ((flags & mandatory) != mandatory) {
-    LOGF("missing mandatory clone() thread flags: %#" PRIx64
-         " out of %#" PRIx64,
-         (flags & mandatory) ^ mandatory, flags);
-    return einval();
-  }
-  if (((flags & CLONE_PARENT_SETTID_LINUX) &&
-       ((ptid & (sizeof(int) - 1)) ||
-        !IsValidMemory(m, ptid, 4, PROT_READ | PROT_WRITE) ||
-        !(ptid_ptr = (_Atomic(int) *)LookupAddress(m, ptid)))) ||
-      ((flags & CLONE_CHILD_SETTID_LINUX) &&
-       ((ctid & (sizeof(int) - 1)) ||
-        !IsValidMemory(m, ctid, 4, PROT_READ | PROT_WRITE) ||
-        !(ctid_ptr = (_Atomic(int) *)LookupAddress(m, ctid))))) {
-    LOGF("bad clone() ptid / ctid pointers: %#" PRIx64, flags);
-    return efault();
-  }
-  m->threaded = true;
-  m->system->jit.threaded = true;
-  if (!(m2 = NewMachine(m->system, m))) {
-    return eagain();
-  }
-  sigfillset(&ss);
-  unassert(!pthread_sigmask(SIG_SETMASK, &ss, &oldss));
-  tid = m2->tid;
-  if (flags & CLONE_SETTLS_LINUX) {
-    m2->fs.base = tls;
-  }
-  if (flags & CLONE_CHILD_CLEARTID_LINUX) {
-    m2->ctid = ctid;
-  }
-  if (flags & CLONE_CHILD_SETTID_LINUX) {
-    atomic_store_explicit(ctid_ptr, Little32(tid), memory_order_release);
-  }
-  Put64(m2->ax, 0);
-  Put64(m2->sp, stack);
-  m2->spawn_sigmask = oldss;
-  unassert(!pthread_attr_init(&attr));
-  unassert(!pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED));
-  err = pthread_create(&thread, &attr, OnSpawn, m2);
-  unassert(!pthread_attr_destroy(&attr));
-  if (err) {
-    FreeMachine(m2);
-    unassert(!pthread_sigmask(SIG_SETMASK, &oldss, 0));
-    return eagain();
-  }
-  if (flags & CLONE_PARENT_SETTID_LINUX) {
-    atomic_store_explicit(ptid_ptr, Little32(tid), memory_order_release);
-  }
-  unassert(!pthread_sigmask(SIG_SETMASK, &oldss, 0));
-  return tid;
-}
-#endif
-
-static bool IsForkOrVfork(u64 flags) {
-  u64 supported = CLONE_CHILD_SETTID_LINUX | CLONE_CHILD_CLEARTID_LINUX;
-  return (flags & ~supported) == SIGCHLD_LINUX ||
-         (flags & ~supported) ==
-             (CLONE_VM_LINUX | CLONE_VFORK_LINUX | SIGCHLD_LINUX);
-}
-
-static int SysClone(struct Machine *m, u64 flags, u64 stack, u64 ptid, u64 ctid,
-                    u64 tls, u64 func) {
-  if (IsForkOrVfork(flags)) {
-#if defined(__wasm__)
-    if (g_process_table.initialized) {
-      pid_t child_pid = guest_proc_fork(m, stack);
-      if (child_pid > 0) {
-        return child_pid;
-      }
-    }
-    ERRF("FORK-COALESCE: SysClone flags=%#lx", flags);
-    return fork_coalesce_begin(m, stack);
-#elif defined(HAVE_FORK)
-    return Fork(m, flags, stack, ctid);
-#else
-    LOGF("forking support disabled");
-    return enosys();
-#endif
-  }
-#ifdef HAVE_THREADS
-  return SysSpawn(m, flags, stack, ptid, ctid, tls, func);
-#else
-  LOGF("threading support disabled");
-  return enosys();
-#endif
-}
-
-static struct Futex *NewFutex(i64 addr) {
-  struct Dll *e;
-  struct Futex *f;
-  if (!(e = dll_first(g_bus->futexes.free))) {
-    LOG_ONCE(LOGF("ran out of futexes"));
-    enomem();
-    return 0;
-  }
-  dll_remove(&g_bus->futexes.free, e);
-  f = FUTEX_CONTAINER(e);
-  f->waiters = 1;
-  f->addr = addr;
-  return f;
-}
-
-static void FreeFutex(struct Futex *f) {
-  dll_make_first(&g_bus->futexes.free, &f->elem);
-}
-
-static int LoadTimespec(struct Machine *m, i64 addr, struct timespec *ts,
-                        u64 mask, u64 need) {
-  const struct timespec_linux *gt;
-  if ((gt = (const struct timespec_linux *)Schlep(m, addr, sizeof(*gt), mask,
-                                                  need))) {
-    ts->tv_sec = Read64(gt->sec);
-    ts->tv_nsec = Read64(gt->nsec);
-    if (0 <= ts->tv_sec && (0 <= ts->tv_nsec && ts->tv_nsec < 1000000000)) {
-      return 0;
-    } else {
-      return einval();
-    }
-  } else {
-    return -1;
-  }
-}
-
-static int LoadTimespecR(struct Machine *m, i64 addr, struct timespec *ts) {
-  return LoadTimespec(m, addr, ts, PAGE_U, PAGE_U);
-}
-
-static int LoadTimespecRW(struct Machine *m, i64 addr, struct timespec *ts) {
-  return LoadTimespec(m, addr, ts, PAGE_U | PAGE_RW, PAGE_U | PAGE_RW);
-}
-
 static int SysFutexWait(struct Machine *m,  //
                         i64 uaddr,          //
                         i32 op,             //
@@ -1467,8 +783,6 @@ static int SysDup2(struct Machine *m, i32 fildes, i32 newfildes) {
     return ebadf();
   }
 #ifdef __wasm__
-  /* N0D: record-only. Applying 19->1 / 21->2 onto the shared parent fd
-   * table hid fork_coalesce_exec and let the parent HALT_KERNEL. */
   if (g_fork_state.pending) {
     LOCK(&m->system->fds.lock);
     fd = GetFd(&m->system->fds, fildes);
@@ -1477,7 +791,6 @@ static int SysDup2(struct Machine *m, i32 fildes, i32 newfildes) {
     if (fildes != newfildes) {
       if (newfildes >= GetFileDescriptorLimit(m->system)) return ebadf();
       fork_coalesce_add_fd_action(WASM_SPAWN_FD_DUP2, fildes, newfildes);
-      ERRF("G12-DUP2-DEFER src=%d dst=%d", fildes, newfildes);
     }
     return newfildes;
   }
@@ -1522,7 +835,6 @@ static int SysDup3(struct Machine *m, i32 fildes, i32 newfildes, i32 flags) {
     UNLOCK(&m->system->fds.lock);
     if (!fd) return ebadf();
     fork_coalesce_add_fd_action(WASM_SPAWN_FD_DUP3, fildes, newfildes);
-    ERRF("G12-DUP3-DEFER src=%d dst=%d", fildes, newfildes);
     return newfildes;
   }
 #endif
@@ -2481,208 +1793,6 @@ static int SysGetsockopt(struct Machine *m, i32 fildes, i32 level, i32 optname,
   return rc;
 }
 
-/* ── T5O: Linux signalfd / signalfd4 (guest-virtual, host-eventfd substrate)─
- *
- * Guest semantics per Linux: object created with a signal mask; readable when
- * a signal pending on the calling task is in the mask; read() consumes those
- * signals as 128-byte signalfd_siginfo records and removes them from the
- * task's pending set (no later handler delivery — no double consumption).
- * Readiness for poll/select/epoll comes from the underlying host eventfd
- * written by SignalfdNotifyOnSignal() when a matching signal is enqueued.
- * SIGKILL/SIGSTOP are filtered from the mask as Linux does. sigsetsize must
- * be 8 on x86-64. No host-signal-domain passthrough: the eventfd is only a
- * wake substrate; the data and consumption live in Blink's guest model. */
-#define SIGNALFD_MAX 16
-#define SFD_NONBLOCK_LINUX 0x0800
-#define SFD_CLOEXEC_LINUX  0x080000
-
-struct SignalFdEntry {
-  int hostfd;   /* host eventfd serving as the fd substrate */
-  u64 mask;     /* guest signal mask (bit n-1 = signal n) */
-  bool in_use;
-};
-
-static struct SignalFdEntry g_signalfd[SIGNALFD_MAX];
-
-static struct SignalFdEntry *SignalfdFind(int hostfd) {
-  for (int i = 0; i < SIGNALFD_MAX; ++i) {
-    if (g_signalfd[i].in_use && g_signalfd[i].hostfd == hostfd) {
-      return &g_signalfd[i];
-    }
-  }
-  return 0;
-}
-static ssize_t SignalfdReadvHost(int, const struct iovec *, int);
-static ssize_t SignalfdWritevHost(int, const struct iovec *, int);
-static int SignalfdPollHost(struct pollfd *, nfds_t, int);
-static int SignalfdCloseHost(int);
-static const struct FdCb kFdCbSignal = {
-    SignalfdCloseHost,
-    SignalfdReadvHost,
-    SignalfdWritevHost,
-    SignalfdPollHost,
-};
-
-static ssize_t SignalfdReadvHost(int fd, const struct iovec *v, int n) {
-  return readv(fd, v, n);  /* substrate only; SysRead intercepts first */
-}
-static ssize_t SignalfdWritevHost(int fd, const struct iovec *v, int n) {
-  return writev(fd, v, n);
-}
-static int SignalfdPollHost(struct pollfd *p, nfds_t n, int t) {
-  return poll(p, n, t);  /* eventfd readiness drives poll/select/epoll */
-}
-static int SignalfdCloseHost(int fd) {
-  struct SignalFdEntry *e = SignalfdFind(fd);
-  if (e) e->in_use = false;
-  return close(fd);
-}
-
-
-/* Called from EnqueueSignal(): a guest signal just became pending on some
- * machine. Wake every signalfd whose mask includes it. */
-void SignalfdNotifyOnSignal(int sig) {
-  if (!(1 <= sig && sig <= 64)) return;
-  for (int i = 0; i < SIGNALFD_MAX; ++i) {
-    if (g_signalfd[i].in_use && (g_signalfd[i].mask & (1ull << (sig - 1)))) {
-      uint64_t one = 1;
-      ssize_t w = write(g_signalfd[i].hostfd, &one, sizeof(one));
-      (void)w;
-    }
-  }
-}
-
-/* Linux struct signalfd_siginfo is exactly 128 bytes. */
-struct SignalFdSigInfo {
-  u32 ssi_signo;
-  u32 ssi_errno;
-  u32 ssi_code;
-  u32 ssi_pid;
-  u32 ssi_uid;
-  u32 _pad[(128 - 5 * sizeof(u32)) / sizeof(u32)];
-};
-_Static_assert(sizeof(struct SignalFdSigInfo) == 128, "siginfo size");
-
-static i64 SysSignalfd4(struct Machine *m, i64 gfd, i64 maskaddr,
-                        i64 sigsetsize, u64 flags) {
-  u64 mask;
-  struct Fd *fd;
-  ERRF("[T5O] CALL gfd=%lld maskaddr=%#llx siz=%lld flags=%#llx tid=%d",
-       (long long)gfd, (unsigned long long)maskaddr, (long long)sigsetsize,
-       (unsigned long long)flags, m->tid);
-  if (flags & ~(u64)(SFD_NONBLOCK_LINUX | SFD_CLOEXEC_LINUX)) {
-    ERRF("[T5O] EINVAL flags=%#llx sigsetsize=%lld", (unsigned long long)flags, (long long)sigsetsize);
-    return einval();
-  }
-  /* Reference parity (observed on current x86-64 Linux): non-8 sigsetsize is
-   * accepted; the mask read is clamped to sizeof(kernel sigset_t) = 8. */
-  u64 nbytes = sigsetsize < 8 ? (u64)sigsetsize : 8;
-  memset(&mask, 0, sizeof(mask));
-  if (nbytes && CopyFromUser(m, &mask, maskaddr, (size_t)nbytes) == -1) {
-    ERRF("[T5O] mask copy failed");
-    return -1;
-  }
-  /* Linux ignores SIGKILL/SIGSTOP in the signalfd mask. */
-  mask &= ~((1ull << (9 - 1)) | (1ull << (19 - 1)));
-  int ifd = (int)(u32)gfd;  /* fd arg is int; guest -1 arrives zero-extended */
-  if (ifd >= 0) {
-    LOCK(&m->system->fds.lock);
-    if ((fd = GetFd(&m->system->fds, ifd))) {
-      struct SignalFdEntry *e = SignalfdFind((int)gfd);
-      if (fd->cb == &kFdCbSignal && e) {
-        e->mask = mask;
-        UNLOCK(&m->system->fds.lock);
-        return ifd;
-      }
-    }
-    UNLOCK(&m->system->fds.lock);
-    return einval();  /* Linux: update of a non-signalfd fd -> EINVAL */
-  }
-  int hostfd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
-  if (hostfd == -1) {
-    ERRF("[T5O] eventfd failed errno=%d", errno);
-    return -1;
-  }
-  LOCK(&m->system->fds.lock);
-  if (!(fd = AddFd(&m->system->fds, hostfd,
-                   (flags & SFD_NONBLOCK_LINUX) ? O_NONBLOCK : 0))) {
-    UNLOCK(&m->system->fds.lock);
-    ERRF("[T5O] AddFd failed");
-    close(hostfd);
-    return -1;
-  }
-  fd->cb = &kFdCbSignal;
-  UNLOCK(&m->system->fds.lock);
-  struct SignalFdEntry *e = 0;
-  for (int i = 0; i < SIGNALFD_MAX; ++i) {
-    if (!g_signalfd[i].in_use) {
-      e = &g_signalfd[i];
-      break;
-    }
-  }
-  if (!e) {
-    close(hostfd);
-    return einval();  /* registry exhausted */
-  }
-  e->in_use = true;
-  e->hostfd = hostfd;
-  e->mask = mask;
-  ERRF("[T5O] CREATED hostfd=%d mask=%#llx", hostfd, (unsigned long long)mask);
-  return hostfd;
-}
-
-
-static i64 SysSignalfdRead(struct Machine *m, i32 fildes, i64 addr, u64 size) {
-  struct SignalFdEntry *e = SignalfdFind(fildes);
-  if (!e) return ebadf();
-  if (size < 128) return einval();  /* Linux: buffer smaller than siginfo */
-  u64 count = size / 128;
-  u64 records = 0;
-  /* consume pending signals of THIS task that match the mask */
-  u64 match;
-  while (records < count && (match = m->signals & e->mask)) {
-    int sig = __builtin_ctzll(match) + 1;
-    m->signals &= ~(1ull << (sig - 1));  /* consumed: handler path skips it */
-    struct SignalFdSigInfo si;
-    memset(&si, 0, sizeof(si));
-    si.ssi_signo = (u32)sig;
-    si.ssi_errno = 0;
-    si.ssi_code = 0;  /* SI_USER; detailed origin not retained by the model */
-    si.ssi_pid = 0;
-    si.ssi_uid = 0;
-    if (CopyToUserWrite(m, addr + (i64)(records * 128), &si, sizeof(si)) == -1) {
-      return -1;
-    }
-    ++records;
-  }
-  if (!records) {
-    /* drain a stale wake so readiness clears, then report per flags */
-    uint64_t v;
-    (void)read(fildes, &v, sizeof(v));
-    int nonblock = 0;
-    LOCK(&m->system->fds.lock);
-    struct Fd *fd = GetFd(&m->system->fds, fildes);
-    if (fd) nonblock = fd->oflags & O_NONBLOCK;
-    UNLOCK(&m->system->fds.lock);
-    if (nonblock) return eagain();
-    /* blocking fd: wait on the eventfd substrate for a matching wake */
-    for (;;) {
-      if (CheckInterrupt(m, false)) return eintr();
-      if (m->signals & e->mask) break;
-      struct pollfd p = {(int)fildes, POLLIN, 0};
-      if (poll(&p, 1, -1) == -1) {
-        if (errno == EINTR) continue;
-        return -1;
-      }
-    }
-    return SysSignalfdRead(m, fildes, addr, size);
-  }
-  if (!(m->signals & e->mask)) {
-    uint64_t v;
-    (void)read(fildes, &v, sizeof(v));  /* clear readiness */
-  }
-  return (i64)(records * 128);
-}
 static i64 SysRead(struct Machine *m, i32 fildes, i64 addr, u64 size) {
   i64 rc;
   int oflags;
@@ -2701,7 +1811,6 @@ static i64 SysRead(struct Machine *m, i32 fildes, i64 addr, u64 size) {
   }
   UNLOCK(&m->system->fds.lock);
   if (!fd) return -1;
-  if (fd->cb == &kFdCbSignal) return SysSignalfdRead(m, fildes, addr, size);
   if ((oflags & O_ACCMODE) == O_WRONLY) return ebadf();
   if (size) {
     InitIovs(&iv);
@@ -2713,41 +1822,6 @@ static i64 SysRead(struct Machine *m, i32 fildes, i64 addr, u64 size) {
   } else {
     rc = 0;
   }
-#ifdef __wasm__
-  /* B7: Pipe-blocking yield - if reading from guest-pipe and got EAGAIN,
-   * transition to BLOCKED and yield to next runnable process. */
-  if (rc == -EAGAIN && fd->guest_data && g_process_table.initialized && g_process_table.count > 1) {
-    struct GuestProcess *self = NULL;
-    int i;
-    for (i = 0; i < MAX_GUEST_PROCESSES; i++) {
-      struct GuestProcess *p = &g_process_table.procs[i];
-      if (p->state != GUEST_PROC_FREE && p->state != GUEST_PROC_REAPED && p->machine == m) {
-        self = p;
-        break;
-      }
-    }
-    if (self && self->state == GUEST_PROC_RUNNABLE) {
-      struct GuestProcess *nxt = self->next_runnable;
-      if (!nxt || nxt->state != GUEST_PROC_RUNNABLE) {
-        nxt = g_process_table.run_queue_head;
-        while (nxt && (nxt == self || nxt->state != GUEST_PROC_RUNNABLE)) {
-          nxt = nxt->next_runnable;
-        }
-      }
-      if (nxt && nxt != self) {
-        ERRF("B7-PIPE-BLOCK pid=%d fd=%d yielding to pid=%d", self->pid, fildes, nxt->pid);
-        guest_proc_transition(self, GUEST_PROC_BLOCKED);
-        self->block_reason = BLOCK_PIPE;
-        self->block_fd = fildes;
-        m->ip -= m->oplen;
-        m->interrupted = true;
-        g_process_table.current = nxt;
-        g_machine = nxt->machine;
-        return 0;
-      }
-    }
-  }
-#endif
   return rc;
 }
 
@@ -2780,31 +1854,6 @@ static i64 SysWrite(struct Machine *m, i32 fildes, i64 addr, u64 size) {
   } else {
     rc = 0;
   }
-#ifdef __wasm__
-  /* B7: Pipe wakeup - after successful write to guest-pipe, wake any processes
-   * blocked reading from the same pipe (matching by guest_data pointer). */
-  if (rc > 0 && fd->guest_data && g_process_table.initialized && g_process_table.count > 1) {
-    int i;
-    for (i = 0; i < MAX_GUEST_PROCESSES; i++) {
-      struct GuestProcess *p = &g_process_table.procs[i];
-      if (p->state == GUEST_PROC_BLOCKED &&
-          p->block_reason == BLOCK_PIPE &&
-          p->machine && p->machine->system) {
-        struct Fd *blocked_fd;
-        LOCK(&p->machine->system->fds.lock);
-        blocked_fd = GetFd(&p->machine->system->fds, p->block_fd);
-        if (blocked_fd && blocked_fd->guest_data == fd->guest_data) {
-          ERRF("B7-PIPE-WAKE pid=%d fd=%d woke by writer pid=%d",
-               p->pid, p->block_fd, g_process_table.current ? g_process_table.current->pid : 0);
-          guest_proc_transition(p, GUEST_PROC_RUNNABLE);
-          p->block_reason = BLOCK_NONE;
-          p->block_fd = -1;
-        }
-        UNLOCK(&p->machine->system->fds.lock);
-      }
-    }
-  }
-#endif
   return HandleSigpipe(m, rc, 0);
 }
 
@@ -3220,22 +2269,6 @@ static int SysFstat(struct Machine *m, i32 fd, i64 staddr) {
     XlatStatToLinux(&gst, &st);
     if (CopyToUserWrite(m, staddr, &gst, sizeof(gst)) == -1) rc = -1;
   }
-#ifdef __wasm__
-  else {
-    /* B7: Fallback for guest-side pipes not in VFS layer */
-    struct Fd *f;
-    LOCK(&m->system->fds.lock);
-    f = GetFd(&m->system->fds, fd);
-    if (f && f->guest_data) {
-      memset(&st, 0, sizeof(st));
-      st.st_mode = S_IFIFO | 0600;
-      XlatStatToLinux(&gst, &st);
-      if (CopyToUserWrite(m, staddr, &gst, sizeof(gst)) == -1) rc = -1;
-      else rc = 0;
-    }
-    UNLOCK(&m->system->fds.lock);
-  }
-#endif
   return rc;
 }
 
@@ -3727,57 +2760,6 @@ static int SysFcntl(struct Machine *m, i32 fildes, i32 cmd, i64 arg) {
   return rc;
 }
 
-// T5R: guest executable identity through procfs (generic).
-//
-// The DISABLE_VFS build compiles out blink's VFS layer entirely: no procfs
-// device is mounted and VfsReadlink is a raw passthrough to the host kernel,
-// so an emulated process asking for its own executable gets the OUTER
-// executable (/bin/blink) instead. Linux semantics for the emulated process
-// require /proc/self/exe to resolve to the loaded guest program. Serve the
-// exact current-process identity paths from the program registered by the
-// loader (m->system->elf.prog); every other path — including other PIDs and
-// non-proc symlinks — passes through unchanged. Fail closed (ENOENT) when no
-// guest executable has been registered, matching the procfs device behavior
-// with a NULL self-exe info.
-#ifdef DISABLE_VFS
-static bool IsCurrentGuestProcExePath(const char *path) {
-  const char *rest;
-  char *end;
-  long pid;
-  if (!path) return false;
-  if (!strcmp(path, "/proc/self/exe")) return true;
-  if (strncmp(path, "/proc/", 6) != 0) return false;
-  rest = path + 6;
-  pid = strtol(rest, &end, 10);
-  return end > rest && !strcmp(end, "/exe") && pid == getpid();
-}
-
-static ssize_t SysReadlinkat(struct Machine *m, int dirfd, i64 path,
-                             i64 bufaddr, i64 bufsiz) {
-  char *buf;
-  ssize_t rc;
-  // This system call raises EINVAL when "bufsiz is not positive."
-  // ──Quoth the Linux Programmer's Manual § readlink(2). Some libc
-  // implementations (e.g. Musl) consider it to be posixly incorrect.
-  if (bufsiz <= 0) return einval();
-  if (IsCurrentGuestProcExePath(LoadStr(m, path))) {
-    const char *guest_prog = m->system->elf.prog;
-    if (!m->system->loaded || !guest_prog || !*guest_prog) {
-      return enoent();  // fail closed: no registered guest executable
-    }
-    size_t len = strlen(guest_prog);
-    if (len > (size_t)bufsiz) len = (size_t)bufsiz;  // readlink truncation
-    if (CopyToUserWrite(m, bufaddr, (void *)guest_prog, len) == -1) return -1;
-    return (ssize_t)len;
-  }
-  if (!(buf = (char *)AddToFreeList(m, malloc(bufsiz)))) return -1;
-  if ((rc = VfsReadlink(GetDirFildes(dirfd), LoadStr(m, path), buf, bufsiz)) !=
-      -1) {
-    if (CopyToUserWrite(m, bufaddr, buf, rc) == -1) rc = -1;
-  }
-  return rc;
-}
-#else
 static ssize_t SysReadlinkat(struct Machine *m, int dirfd, i64 path,
                              i64 bufaddr, i64 bufsiz) {
   char *buf;
@@ -3793,7 +2775,6 @@ static ssize_t SysReadlinkat(struct Machine *m, int dirfd, i64 path,
   }
   return rc;
 }
-#endif
 
 static int SysChmod(struct Machine *m, i64 path, u32 mode) {
   return SysFchmodat(m, AT_FDCWD_LINUX, path, mode);
@@ -4016,7 +2997,10 @@ static void ExecveBlink(struct Machine *m, char *prog, char **argv,
       // point of no return
       // prog/argv/envp are copied onto the freelist
       m->sysdepth = 0;
+      m->insyscall = false; /* G12: new image must not inherit stale flag */
+      CollectPageLocksForce(m);
       CollectPageLocks(m);
+
       // TODO(jart): Prevent possibility of stack overflow.
       SYS_LOGF("m->system->exec(%s)", prog);
       SysCloseExec(m->system);
@@ -4030,9 +3014,15 @@ static void ExecveBlink(struct Machine *m, char *prog, char **argv,
 
 static int SysExecve(struct Machine *m, i64 pa, i64 aa, i64 ea) {
   char *prog, **argv, **envp;
+  ERRF("G12-EXECVE-ENTER pid=%d pa=%#llx aa=%#llx ea=%#llx",
+       m->tid, (unsigned long long)pa, (unsigned long long)aa,
+       (unsigned long long)ea);
   if (!(prog = CopyStr(m, pa))) return -1;
+  ERRF("G12-EXECVE-PROG pid=%d prog=%s", m->tid, prog);
   if (!(argv = CopyStrList(m, aa))) return -1;
+  ERRF("G12-EXECVE-ARGV pid=%d argv0=%s", m->tid, argv[0] ? argv[0] : "null");
   if (!(envp = CopyStrList(m, ea))) return -1;
+  ERRF("G12-EXECVE-ENVP pid=%d", m->tid);
 #ifdef __wasm__
   /* Fork-exec coalescing: if a fork is pending, this execve is the child's.
    * Trigger the kernel fn-based clone (spawn_exec_entry applies recorded fd
@@ -4068,108 +3058,6 @@ static int SysWait4(struct Machine *m, int pid, i64 opt_out_wstatus_addr,
    * the guest holds the real pid, so this is normally a passthrough. */
   pid = fork_coalesce_wait(pid);
 #endif
-#ifdef __wasm__
-  /* Candidate B: reap GuestProcess zombie children; block+switch when live
-   * children exist but none have exited. Falls through to kernel wait when
-   * this process has no GuestProcess children (fork-coalesce/kernel path). */
-  if (g_process_table.initialized) {
-    struct GuestProcess *self = NULL;
-    struct GuestProcess *zombie = NULL;
-    int i;
-    if (g_process_table.current && g_process_table.current->machine == m) {
-      self = g_process_table.current;
-    } else {
-      for (i = 0; i < MAX_GUEST_PROCESSES; i++) {
-        struct GuestProcess *p = &g_process_table.procs[i];
-        if (p->state != GUEST_PROC_FREE && p->state != GUEST_PROC_REAPED &&
-            p->machine == m) {
-          self = p;
-          break;
-        }
-      }
-    }
-    if (self && (pid > 0 || pid == -1)) {
-      bool has_any = false;
-      for (i = 0; i < MAX_GUEST_PROCESSES; i++) {
-        struct GuestProcess *p = &g_process_table.procs[i];
-        if (p != self && p->state != GUEST_PROC_FREE &&
-            p->state != GUEST_PROC_REAPED && p->ppid == self->pid &&
-            (pid == -1 || p->pid == pid)) {
-          has_any = true;
-          break;
-        }
-      }
-      if (has_any) {
-        struct GuestProcess *z;
-        m->interrupted = false;
-        zombie = NULL;
-        for (z = self->next_zombie; z; z = z->next_zombie) {
-          if (z->state == GUEST_PROC_ZOMBIE && (pid == -1 || z->pid == pid)) {
-            zombie = z;
-            break;
-          }
-        }
-        if (zombie) {
-          int exitcode = zombie->exit_status & 255;
-          pid_t cpid = zombie->pid;
-          guest_proc_reap(zombie);
-          if (opt_out_wstatus_addr) {
-            gwstatus = exitcode << 8;
-            Write32(gwstatusb, gwstatus);
-            CopyToUserWrite(m, opt_out_wstatus_addr, gwstatusb, sizeof(gwstatusb));
-          }
-          if (opt_out_rusage_addr) {
-            memset(&grusage, 0, sizeof(grusage));
-            CopyToUserWrite(m, opt_out_rusage_addr, &grusage, sizeof(grusage));
-          }
-          return cpid;
-        }
-        if (options & WNOHANG_LINUX) {
-          return 0;
-        }
-        {
-          bool has_live = false;
-          for (i = 0; i < MAX_GUEST_PROCESSES; i++) {
-            struct GuestProcess *p = &g_process_table.procs[i];
-            if (p != self && p->state != GUEST_PROC_FREE &&
-                p->state != GUEST_PROC_REAPED && p->state != GUEST_PROC_ZOMBIE &&
-                p->ppid == self->pid && (pid == -1 || p->pid == pid)) {
-              has_live = true;
-              break;
-            }
-          }
-          if (has_live) {
-            struct GuestProcess *nxt = NULL;
-            for (i = 0; i < MAX_GUEST_PROCESSES; i++) {
-              struct GuestProcess *p = &g_process_table.procs[i];
-              if (p != self && p->state == GUEST_PROC_RUNNABLE && p->machine &&
-                  p->ppid == self->pid) {
-                nxt = p;
-                break;
-              }
-            }
-            if (!nxt) {
-              for (nxt = g_process_table.run_queue_head; nxt;
-                   nxt = nxt->next_runnable) {
-                if (nxt != self && nxt->state == GUEST_PROC_RUNNABLE &&
-                    nxt->machine) {
-                  break;
-                }
-              }
-            }
-            if (nxt) {
-              m->ip -= m->oplen;
-              m->interrupted = true;
-              g_process_table.current = nxt;
-              g_machine = nxt->machine;
-              return 0;
-            }
-          }
-        }
-      }
-    }
-  }
-#endif
   if ((options = XlatWait(options)) == -1) return -1;
   if ((opt_out_wstatus_addr && !IsValidMemory(m, opt_out_wstatus_addr,
                                               sizeof(gwstatusb), PROT_WRITE)) ||
@@ -4178,24 +3066,24 @@ static int SysWait4(struct Machine *m, int pid, i64 opt_out_wstatus_addr,
     return -1;
   }
 #ifdef __wasm__
-  /* G12: once check_child reaped the kernel child, satisfy libuv waitpid
-   * from the stash so the close event fires. */
+  /* G12 child-exit: once check_child reaped the kernel child, satisfy libuv's
+   * waitpid() directly from the stash so the child looks reaped to the guest
+   * and the close event fires. Handles pid-specific and wait-any reaps. */
   if (fork_coalesce_child_done() &&
       (pid == g_fork_state.real_pid || pid == -1 ||
        (pid < -1 && pid == -g_fork_state.real_pid))) {
     if (opt_out_wstatus_addr) {
+      u8 sbuf[4];
       gwstatus = (i32)((((g_fork_state.child_status >> 8) & 0xff) << 8) |
                        (g_fork_state.child_status & 0x7f));
-      Write32(gwstatusb, gwstatus);
-      CopyToUserWrite(m, opt_out_wstatus_addr, gwstatusb, sizeof(gwstatusb));
+      Write32(sbuf, gwstatus);
+      CopyToUserWrite(m, opt_out_wstatus_addr, sbuf, sizeof(sbuf));
     }
     if (opt_out_rusage_addr) {
       memset(&grusage, 0, sizeof(grusage));
       CopyToUserWrite(m, opt_out_rusage_addr, &grusage, sizeof(grusage));
     }
     rc = g_fork_state.real_pid;
-    ERRF("G12-WAIT4-STASH pid=%d reaped=%d status=%d", pid, rc,
-         g_fork_state.child_status);
     fork_coalesce_reap(g_fork_state.fake_pid);
     return rc;
   }
@@ -5372,9 +4260,12 @@ static int Poll(struct Machine *m, i64 fdsaddr, u64 nfds,
 static int SysPoll(struct Machine *m, i64 fdsaddr, u64 nfds, i32 timeout_ms) {
   struct timespec deadline;
 #ifdef __wasm__
-  /* Never shrink guest timeout=-1 to 16ms. Poll() already slices with
-   * kPollingMs and CheckInterrupt runs check_child. Returning 0 for an
-   * infinite wait trips libuv uv__io_poll assert(timeout != -1). */
+  /* G12 child-exit: cap the host wait while a coalesced child is outstanding so
+   * the loop wakes frequently, runs fork_coalesce_check_child(), and the guest
+   * gets its SIGCHLD + waitpid result promptly. */
+  if (fork_coalesce_unreaped_child()) {
+    if (timeout_ms < 0 || timeout_ms > 16) timeout_ms = 16;
+  }
   fork_coalesce_check_child(m);
 #endif
   if (timeout_ms < 0) {
@@ -5536,7 +4427,6 @@ static int SysTkill(struct Machine *m, int tid, int sig) {
       return rc;
     } else {
       m->signals |= (u64)1 << (sig - 1);
-      SignalfdNotifyOnSignal(sig);  /* T5O: wake signalfd watchers */
       return 0;
     }
   }
@@ -5605,6 +4495,35 @@ static int SysSetsid(struct Machine *m) {
 
 static i32 SysGetsid(struct Machine *m, i32 pid) {
   return getsid(pid);
+}
+
+
+/* G12: node/libuv calls capget during bootstrap; ENOSYS made the caller spin
+ * forever (getpid→capget→getuid×4 loop). Return success with no capabilities:
+ * user_cap_hdr version 1 (LINUX_CAPABILITY_VERSION_1), 0 effective/inheritable
+ * caps, all 1 permitted bits cleared. */
+static int SysCapget(struct Machine *m, i64 hdraddr, i64 dataaddr) {
+  u8 *hdr;
+  if (!hdraddr)
+    return 0;
+  if (!(hdr = (u8 *)SchlepW(m, hdraddr, 8)))
+    return efault();
+  /* Accept any version the guest asks for; report V1 and zero caps.
+   * Real Linux versions are 0x19980330/V1, 0x19980331/V2, 0x20071026/V3 —
+   * our earlier check `version>1` rejected them all as EINVAL, leaving the
+   * caller spinning. */
+  /* Linux capability versions: V1=0x19980330, V2=0x19980331, V3=0x20071026.
+   * Echo back the requested version so the caller doesn't retry. */
+  u32 req_version = Read32(hdr);
+  Write32(hdr, req_version);
+  Write32(hdr + 4, 0);
+  if (dataaddr) {
+    u8 *data;
+    if (!(data = (u8 *)SchlepW(m, dataaddr, 12)))
+      return efault();
+    memset(data, 0, 12); /* effective, permitted, inheritable */
+  }
+  return 0;
 }
 
 static int SysGetpid(struct Machine *m) {
@@ -5902,6 +4821,7 @@ static int SysPipe(struct Machine *m, i64 pipefds_addr) {
 }
 
 #ifdef HAVE_EPOLL_PWAIT1
+#include <sys/epoll.h>
 
 static i32 SysEventfd2(struct Machine *m, u32 initval, i32 flags) {
   int lim, fildes, oflags, sysflags;
@@ -5926,7 +4846,6 @@ static i32 SysEventfd2(struct Machine *m, u32 initval, i32 flags) {
     return einval();
   }
   if (!(lim = GetFileDescriptorLimit(m->system))) return emfile();
-  oflags |= O_RDWR;
   if ((fildes = eventfd(initval, sysflags)) != -1) {
     if (fildes >= lim) {
       close(fildes);
@@ -5954,7 +4873,6 @@ static i32 SysEpollCreate1(struct Machine *m, i32 flags) {
     return einval();
   }
   if (!(lim = GetFileDescriptorLimit(m->system))) return emfile();
-  oflags |= O_RDWR;
   if ((fildes = epoll_create1(sysflags)) != -1) {
     if (fildes >= lim) {
       close(fildes);
@@ -6032,9 +4950,6 @@ static i32 EpollPwait(struct Machine *m, i32 epfd, i64 eventsaddr,
     SIG_LOGF("sigmask push %" PRIx64, m->sigmask);
   }
   if (!CheckInterrupt(m, false)) {
-#ifdef __wasm__
-    int g12_slice_logged = 0;
-#endif
     do {
       now = GetTime();
       if (CompareTime(now, deadline) < 0) {
@@ -6042,33 +4957,6 @@ static i32 EpollPwait(struct Machine *m, i32 epfd, i64 eventsaddr,
       } else {
         waitfor = GetZeroTime();
       }
-#ifdef __wasm__
-      /* N0D: slice the *host* wait so check_child/freeze can run, but
-       * keep the original guest deadline. Returning 0 while deadline
-       * remains (timeout=-1 -> GetMaxTime) makes libuv hit
-       * assert(timeout != -1) in uv__io_poll. */
-      if (fork_coalesce_unreaped_child()) {
-        fork_coalesce_check_child(m);
-      }
-      if (fork_coalesce_should_park(m)) {
-        atomic_store_explicit(&m->g12_parked, true, memory_order_release);
-        m->interrupted = true;
-        errno = EINTR;
-        rc = -1;
-        break;
-      }
-      if (fork_coalesce_unreaped_child() || g_fork_state.freeze_siblings) {
-        struct timespec cap = FromMilliseconds(16);
-        if (CompareTime(waitfor, cap) > 0) {
-          if (!g12_slice_logged) {
-            ERRF("G12-PWAIT-SLICE tid=%d orig_sec=%lld cap_ms=16", m->tid,
-                 (long long)waitfor.tv_sec);
-            g12_slice_logged = 1;
-          }
-          waitfor = cap;
-        }
-      }
-#endif
 #if defined(HAVE_EPOLL_PWAIT2) && !defined(MUSL_CROSS_MAKE)
       rc = epoll_pwait2(epfd, events, maxevents, &waitfor, &oldmask);
 #else
@@ -6079,10 +4967,6 @@ static i32 EpollPwait(struct Machine *m, i32 epfd, i64 eventsaddr,
         if (CheckInterrupt(m, false)) {
           break;
         }
-#ifdef __wasm__
-      } else if (rc == 0 && CompareTime(GetTime(), deadline) < 0) {
-        continue;
-#endif
       } else {
         break;
       }
@@ -6111,7 +4995,9 @@ static i32 SysEpollPwait(struct Machine *m, i32 epfd, i64 eventsaddr,
                          u64 sigsetsize) {
   struct timespec deadline;
 #ifdef __wasm__
-  /* Host 16ms slice lives in EpollPwait. Do not rewrite guest timeout=-1. */
+  if (fork_coalesce_unreaped_child()) {
+    if (timeout < 0 || timeout > 16) timeout = 16;
+  }
   fork_coalesce_check_child(m);
 #endif
   if (timeout >= 0) {
@@ -6163,6 +5049,27 @@ void OpSyscall(P) {
     return;
   }
   STATISTIC(++syscalls);
+  /* G12 abort-site trace: during musl abort()->raise() the stack is intact at
+   * the rt_sigprocmask helpers; dump 32 words so the abort-site return address
+   * (raise frame + abort frame) is captured. */
+  if (m->ip >= 0x87048da0 && m->ip <= 0x87048fc0) {
+    char dbg[1400];
+    int o = 0;
+    uintptr_t rsp = Read64(m->sp);
+    o += snprintf(dbg + o, sizeof(dbg) - o, "G12-ABORT-STK2 rip=%llx rsp=%llx",
+                  (unsigned long long)m->ip, (unsigned long long)rsp);
+    for (int i = 0; i < 32; i++) {
+      uintptr_t addr = rsp + i * 8;
+      uint64_t v = 0;
+      if (CopyFromUser(m, &v, addr, 8) != -1)
+        o += snprintf(dbg + o, sizeof(dbg) - o, " [%d]=%llx", i,
+                      (unsigned long long)v);
+      else
+        o += snprintf(dbg + o, sizeof(dbg) - o, " [%d]=?", i);
+    }
+    o += snprintf(dbg + o, sizeof(dbg) - o, "\n");
+    write(2, dbg, o);
+  }
   // make sure blinkenlights display is up to date before performing any
   // potentially blocking operations which would otherwise freeze things
   if (m->system->redraw && m->tid == m->system->pid) {
@@ -6206,6 +5113,10 @@ void OpSyscall(P) {
   r0 = Get64(m->r10);
   r8 = Get64(m->r8);
   r9 = Get64(m->r9);
+  if (g_fork_state.pending)
+    ERRF("G12-PENDING-SYSCALL-IN tid=%d nr=%#llx di=%#llx si=%#llx dx=%#llx", m->tid,
+         (unsigned long long)ax, (unsigned long long)di,
+         (unsigned long long)si, (unsigned long long)dx);
   switch (ax & 0xfff) {
     SYSCALL(3, 0x000, "read", SysRead, STRACE_READ);
     SYSCALL(3, 0x001, "write", SysWrite, STRACE_WRITE);
@@ -6256,8 +5167,6 @@ void OpSyscall(P) {
     SYSCALL(1, 0x051, "fchdir", SysFchdir, STRACE_FCHOWN);
     SYSCALL(2, 0x052, "rename", SysRename, STRACE_RENAME);
     SYSCALL(2, 0x053, "mkdir", SysMkdir, STRACE_MKDIR);
-    SYSCALL(1, 0x054, "rmdir", SysRmdir, STRACE_RMDIR);
-    SYSCALL(2, 0x055, "creat", SysCreat, STRACE_CREAT);
     SYSCALL(2, 0x056, "link", SysLink, STRACE_LINK);
     SYSCALL(1, 0x057, "unlink", SysUnlink, STRACE_UNLINK);
     SYSCALL(2, 0x058, "symlink", SysSymlink, STRACE_SYMLINK);
@@ -6278,6 +5187,7 @@ void OpSyscall(P) {
     SYSCALL(2, 0x073, "getgroups", SysGetgroups, STRACE_2);
     SYSCALL(1, 0x079, "getpgid", SysGetpgid, STRACE_GETPGID);
     SYSCALL(1, 0x07C, "getsid", SysGetsid, STRACE_1);
+    SYSCALL(2, 0x07D, "capget", SysCapget, STRACE_2);
     SYSCALL(1, 0x07F, "rt_sigpending", SysSigpending, STRACE_1);
     SYSCALL(2, 0x089, "statfs", SysStatfs, STRACE_2);
     SYSCALL(2, 0x08A, "fstatfs", SysFstatfs, STRACE_2);
@@ -6414,20 +5324,10 @@ void OpSyscall(P) {
 #endif /* DISABLE_NONPOSIX */
     case 0x3C:
       SYS_LOGF("%s(%#" PRIx64 ")", "exit", di);
-#ifdef __wasm__
-      if (!GuestProcTryExit(m, (int)di)) SysExit(m, di);
-      break;
-#else
       SysExit(m, di);
-#endif
     case 0xE7:
       SYS_LOGF("%s(%#" PRIx64 ")", "exit_group", di);
-#ifdef __wasm__
-      if (!GuestProcTryExit(m, (int)di)) SysExitGroup(m, di);
-      break;
-#else
       SysExitGroup(m, di);
-#endif
     case 0x00F:
       SigRestore(m);
       m->interrupted = true;  // preevnt ax clobber
@@ -6445,11 +5345,6 @@ void OpSyscall(P) {
       // time() is also noisy in some environments.
       ax = SysTime(m, di);
       break;
-    case 0x11a:
-    case 0x121:
-      // signalfd / signalfd4 (T5O)
-      ax = SysSignalfd4(m, di, si, dx, (u64)r0);
-      break;
     default:
     DefaultCase:
       LOGF("missing syscall 0x%03" PRIx64, ax);
@@ -6462,9 +5357,12 @@ void OpSyscall(P) {
   unassert(--m->sysdepth >= 0);
   CollectPageLocks(m);
   if (m->sysdepth == 0 && m->pagelocks.i) {
+    /* G12: in-process exec (ExecveBlink) resets sysdepth to 0 mid-syscall;
+     * page pins taken while loading the new image record at depth 0 and can
+     * never be collected by the depth>0 rule. At a depth-0 epilogue ANY
+     * remaining locks are stale by definition — release them. */
     CollectPageLocksForce(m);
   }
-  unassert(!m->pagelocks.i || m->sysdepth);
   CollectGarbage(m, mark);
 #ifdef __wasm__
   if (m->g12_holds_serializer) {

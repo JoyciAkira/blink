@@ -1,0 +1,308 @@
+/*-*- mode:c;indent-tabs-mode:nil;c-basic-offset:2;tab-width:8;coding:utf-8 -*-│
+│ vi: set et ft=c ts=2 sts=2 sw=2 fenc=utf-8                               :vi │
+╞══════════════════════════════════════════════════════════════════════════════╡
+│ Copyright 2022 Justine Alexandra Roberts Tunney                              │
+│                                                                              │
+│ Permission to use, copy, modify, and/or distribute this software for         │
+│ any purpose with or without fee is hereby granted, provided that the         │
+│ above copyright notice and this permission notice appear in all copies.      │
+│                                                                              │
+│ THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL                │
+│ WARRANTIES WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED                │
+│ WARRANTIES OF MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE             │
+│ AUTHOR BE LIABLE FOR ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL         │
+│ DAMAGES OR ANY DAMAGES WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR        │
+│ PROFITS, WHETHER IN AN ACTION OF CONTRACT, NEGLIGENCE OR OTHER               │
+│ TORTIOUS ACTION, ARISING OUT OF OR IN CONNECTION WITH THE USE OR             │
+│ PERFORMANCE OF THIS SOFTWARE.                                                │
+╚─────────────────────────────────────────────────────────────────────────────*/
+#include "blink/syscall.h"
+
+#include <dirent.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <grp.h>
+#include <inttypes.h>
+#include <limits.h>
+#include <net/if.h>
+#include <netdb.h>
+#include <netinet/in.h>
+#include <netinet/ip.h>
+#include <poll.h>
+#include <signal.h>
+#include <stdarg.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/eventfd.h>
+#include <sys/file.h>
+#include <sys/ioctl.h>
+#include <sys/mman.h>
+#include <sys/param.h>
+#include <sys/resource.h>
+#include <sys/select.h>
+#include <sys/socket.h>
+#include <sys/statvfs.h>
+#include <sys/time.h>
+#include <sys/times.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <time.h>
+#include <unistd.h>
+
+#include "blink/ancillary.h"
+#include "blink/assert.h"
+#include "blink/atomic.h"
+#include "blink/bitscan.h"
+#include "blink/bus.h"
+#include "blink/case.h"
+#include "blink/checked.h"
+#include "blink/debug.h"
+#include "blink/endian.h"
+#include "blink/errno.h"
+#include "blink/flag.h"
+#include "blink/fork-coalesce.h"
+#include "blink/iovs.h"
+#include "blink/limits.h"
+#include "blink/linux.h"
+#include "blink/loader.h"
+#include "blink/log.h"
+#include "blink/machine.h"
+#include "blink/macros.h"
+#include "blink/map.h"
+#include "blink/ndelay.h"
+#include "blink/overlays.h"
+#include "blink/pml4t.h"
+#include "blink/preadv.h"
+#include "blink/random.h"
+#include "blink/signal.h"
+#include "blink/stats.h"
+#include "blink/strace.h"
+#include "blink/swap.h"
+#include "blink/thread.h"
+#include "blink/timespec.h"
+#include "blink/util.h"
+#include "blink/vfs.h"
+#include "blink/xlat.h"
+
+#ifdef __linux
+#include <sys/prctl.h>
+#endif
+
+#ifdef __EMSCRIPTEN__
+#include <emscripten.h>
+#endif
+
+#ifdef __HAIKU__
+#include <OS.h>
+#include <sys/sockio.h>
+#endif
+
+#ifdef HAVE_SCHED_H
+#include <sched.h>
+#endif
+
+#ifdef HAVE_EPOLL_PWAIT1
+#include <sys/epoll.h>
+#endif
+
+#ifdef HAVE_SYS_MOUNT_H
+#include <sys/mount.h>
+#endif
+
+#ifdef SO_LINGER_SEC
+#define SO_LINGER_ SO_LINGER_SEC
+#else
+#define SO_LINGER_ SO_LINGER
+#endif
+
+#define SYSARGS0
+#define SYSARGS1 , di
+#define SYSARGS2 , di, si
+#define SYSARGS3 , di, si, dx
+#define SYSARGS4 , di, si, dx, r0
+#define SYSARGS5 , di, si, dx, r0, r8
+#define SYSARGS6 , di, si, dx, r0, r8, r9
+
+#define SYSCALL(arity, ordinal, name, func, signature)            \
+  case ordinal:                                                   \
+    if (STRACE && FLAG_strace >= (signature)[0]) {                \
+      Strace(m, name, true, &(signature)[1] SYSARGS##arity);      \
+    }                                                             \
+    ax = func(m SYSARGS##arity);                                  \
+    if (STRACE && FLAG_strace) {                                  \
+      Strace(m, name, false, &(signature)[1], ax SYSARGS##arity); \
+    }                                                             \
+    break
+
+char *g_blink_path;
+bool FLAG_statistics;
+
+// delegate to work around function pointer errors, b/c
+// old musl toolchains using `int ioctl(int, int, ...)`
+static int SystemIoctl(int fd, unsigned long request, ...) {
+  va_list va;
+  uintptr_t arg;
+  va_start(va, request);
+  arg = va_arg(va, uintptr_t);
+  va_end(va);
+  return VfsIoctl(fd, request, (void *)arg);
+}
+
+#ifdef __EMSCRIPTEN__
+// If this runs on the main thread, the browser is blocked until we return
+// back to the main loop. Yield regularly when the process waits for some
+// user input.
+
+int em_poll(struct pollfd *fds, nfds_t nfds, int timeout) {
+  int ret = VfsPoll(fds, nfds, timeout);
+  if (ret == 0) emscripten_sleep(50);
+  return ret;
+}
+
+ssize_t em_readv(int fd, const struct iovec *iov, int iovcnt) {
+  // Handle blocking reads by waiting for POLLIN
+  if ((VfsFcntl(fd, F_GETFL, 0) & O_NONBLOCK) == 0) {
+    struct pollfd pfd;
+    pfd.fd = fd;
+    pfd.events = POLLIN;
+    while (em_poll(&pfd, 1, 50) == 0) {
+    }
+  }
+  size_t ret = VfsReadv(fd, iov, iovcnt);
+  if (ret == -1 && errno == EAGAIN) emscripten_sleep(50);
+  return ret;
+}
+#endif
+
+static int my_tcgetwinsize(int fd, struct winsize *ws) {
+  return VfsIoctl(fd, TIOCGWINSZ, (void *)ws);
+}
+
+static int my_tcsetwinsize(int fd, const struct winsize *ws) {
+  return VfsIoctl(fd, TIOCSWINSZ, (void *)ws);
+}
+
+const struct FdCb kFdCbHost = {
+    .close = VfsClose,
+#ifdef __EMSCRIPTEN__
+    .readv = em_readv,
+#else
+    .readv = VfsReadv,
+#endif
+    .writev = VfsWritev,
+#ifdef __EMSCRIPTEN__
+    .poll = em_poll,
+#else
+    .poll = VfsPoll,
+#endif
+    .tcgetattr = VfsTcgetattr,
+    .tcsetattr = VfsTcsetattr,
+    .tcgetwinsize = my_tcgetwinsize,
+    .tcsetwinsize = my_tcsetwinsize,
+};
+
+struct Fd *GetAndLockFd(struct Machine *m, int fildes) {
+  struct Fd *fd;
+  LOCK(&m->system->fds.lock);
+  if ((fd = GetFd(&m->system->fds, fildes))) LockFd(fd);
+  UNLOCK(&m->system->fds.lock);
+  return fd;
+}
+
+int GetDirFildes(int fildes) {
+  if (fildes == AT_FDCWD_LINUX) return AT_FDCWD;
+  return fildes;
+}
+
+const char *GetDirFildesPath(struct System *s, int fildes) {
+  struct Fd *fd;
+  if (fildes == AT_FDCWD_LINUX) return ".";
+  if ((fd = GetFd(&s->fds, fildes))) return fd->path;
+  return 0;
+}
+
+void SignalActor(struct Machine *m) {
+  for (;;) {
+    STATISTIC(++interps);
+    JitlessDispatch(DISPATCH_NOTHING);
+    if (atomic_load_explicit(&m->attention, memory_order_acquire)) {
+      if (m->restored) break;
+      CheckForSignals(m);
+    }
+  }
+}
+
+bool DeliverSignalRecursively(struct Machine *m, int sig) {
+  bool issigsuspend;
+  sigset_t unblock, oldmask;
+  SYS_LOGF("recursing %s", DescribeSignal(sig));
+  if (m->sigdepth >= kMaxSigDepth) {
+    LOGF("exceeded max signal depth");
+    return false;
+  }
+  // we're officially calling a signal handler
+  // run the signal handler code inside the i/o routine
+  // it's very important that no locks are currently held
+  // garbage may exist on the freelist for calls like sendmsg
+  ++m->sigdepth;
+  if ((issigsuspend = m->issigsuspend)) {
+    m->issigsuspend = false;
+    unassert(!sigemptyset(&unblock));
+    unassert(!pthread_sigmask(SIG_BLOCK, &unblock, &oldmask));
+  }
+  m->restored = false;
+  m->insyscall = false;
+  SignalActor(m);
+  m->insyscall = true;
+  m->restored = false;
+  if (issigsuspend) {
+    unassert(!pthread_sigmask(SIG_SETMASK, &oldmask, 0));
+    m->issigsuspend = true;
+  }
+  --m->sigdepth;
+  return true;
+}
+
+bool CheckInterrupt(struct Machine *m, bool restartable) {
+  bool res, restart;
+  int sig, delivered;
+#ifdef __wasm__
+  if (fork_coalesce_unreaped_child()) {
+    fork_coalesce_check_child(m);
+  }
+  if (fork_coalesce_should_park(m)) {
+    atomic_store_explicit(&m->g12_parked, true, memory_order_release);
+    m->interrupted = true;
+    errno = EINTR;
+    return true;
+  }
+  if (atomic_load_explicit(&m->killed, memory_order_acquire)) {
+    m->interrupted = true;
+    errno = EINTR;
+    return true;
+  }
+#endif
+  // an actual i/o call just received EINTR from the kernel
+HandleSomeMoreInterrupts:
+  // determine if there's any signals pending for our guest
+  Put64(m->ax, -EINTR_LINUX);
+  if ((sig = ConsumeSignal(m, &delivered, &restart))) {
+    TerminateSignal(m, sig, 0);
+  }
+  if (delivered) {
+    if (DeliverSignalRecursively(m, delivered)) {
+      if (restart && restartable) {
+        // try to consume some more signals while we're here
+        goto HandleSomeMoreInterrupts;
+      } else {
+        // let the i/o routine return eintr
+        errno = EINTR;
+        res = true;
+      }
+    } else {
+      errno = EINTR;
+      res = true;
+    }
+
+[Showing lines 1-300 of 5915. Use :301 to continue]

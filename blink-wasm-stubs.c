@@ -22,3 +22,17 @@ int SysIoctl(struct Machine *m, int fildes, u64 request, i64 addr) {
 pid_t fork(void) {
   return -1;
 }
+
+/* B7: pipe/pipe2 are not supported in wasm32 host environment.
+ * Calling the real host pipe() causes a fatal wasm trap.
+ * Return -1 so guest SysPipe2 fails gracefully with ENOSYS. */
+int pipe(int pipefd[2]) {
+  (void)pipefd;
+  return -1;
+}
+
+int pipe2(int pipefd[2], int flags) {
+  (void)pipefd;
+  (void)flags;
+  return -1;
+}

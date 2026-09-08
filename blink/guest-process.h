@@ -84,6 +84,7 @@ struct GuestProcess {
   /* === Lifecycle & Exit Information === */
   GuestProcState state;
   GuestBlockReason block_reason;
+  int block_fd;                      /* B7: host/guest fd the process is blocked on */
   int exit_status;                    /* Raw wstatus for wait4() */
   bool child_exited;                  /* Kernel-side exited flag */
 

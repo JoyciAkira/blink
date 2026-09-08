@@ -35,6 +35,7 @@
 #include "blink/macros.h"
 #include "blink/thread.h"
 #include "blink/vfs.h"
+#include "blink/guest-pipe.h"
 
 void InitFds(struct Fds *fds) {
   fds->list = 0;
@@ -61,6 +62,26 @@ struct Fd *AddFd(struct Fds *fds, int fildes, int oflags) {
     einval();
     return 0;
   }
+}
+
+/* B7: Allocate a new Fd with the lowest available file descriptor number.
+ * Used for guest-side pipes/sockets that don't have a host fd backing. */
+struct Fd *AddFdAuto(struct Fds *fds, int oflags) {
+  int fildes = 0;
+  struct Dll *e;
+  /* Find lowest available fd number */
+  for (;;) {
+    bool used = false;
+    for (e = dll_first(fds->list); e; e = dll_next(fds->list, e)) {
+      if (FD_CONTAINER(e)->fildes == fildes) {
+        used = true;
+        break;
+      }
+    }
+    if (!used) break;
+    fildes++;
+  }
+  return AddFd(fds, fildes, oflags);
 }
 
 struct Fd *ForkFd(struct Fds *fds, struct Fd *fd, int fildes, int oflags) {
@@ -141,6 +162,9 @@ int FreeFd(struct Fd *fd) {
     
     unassert(!pthread_mutex_destroy(&fd->lock));
     free(fd->path);
+    if (fd->guest_data) {
+      GuestPipeReleaseData(fd->guest_data);
+    }
     free(fd);
   }
   return rc;
@@ -213,6 +237,12 @@ void CloneFds(struct Fds *child, struct Fds *parent) {
       child_fd->socktype = parent_fd->socktype;
       child_fd->norestart = parent_fd->norestart;
       memcpy(&child_fd->saddr, &parent_fd->saddr, sizeof(child_fd->saddr));
+      /* B7: Inherit guest-side pipe callbacks and data */
+      child_fd->cb = parent_fd->cb;
+      if (parent_fd->guest_data) {
+        child_fd->guest_data = parent_fd->guest_data;
+        GuestPipeAcquireData(child_fd->guest_data);
+      }
     }
   }
   UNLOCK(&parent->lock);
