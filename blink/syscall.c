@@ -4158,6 +4158,9 @@ static int SysWait4(struct Machine *m, int pid, i64 opt_out_wstatus_addr,
               }
             }
             if (nxt) {
+              guest_proc_transition(self, GUEST_PROC_BLOCKED);
+              self->block_reason = BLOCK_WAIT4;
+              self->block_pid = pid;
               m->ip -= m->oplen;
               m->interrupted = true;
               g_process_table.current = nxt;
@@ -5805,10 +5808,55 @@ static i32 SysGetresgid(struct Machine *m,  //
 }
 
 static int SysSchedYield(struct Machine *m) {
+#ifdef __wasm__
+  /* B8: In wasm32 single-threaded environment, host sched_yield() is useless.
+   * Instead, yield to the guest scheduler if multiple processes exist.
+   * Do NOT rewind IP — sched_yield returns normally to guest code. */
+  if (g_process_table.initialized && g_process_table.count > 1) {
+    struct GuestProcess *self = NULL;
+    struct GuestProcess *nxt;
+    int i;
+    
+    /* Find current process */
+    if (g_process_table.current && g_process_table.current->machine == m) {
+      self = g_process_table.current;
+    } else {
+      for (i = 0; i < MAX_GUEST_PROCESSES; i++) {
+        struct GuestProcess *p = &g_process_table.procs[i];
+        if (p->state != GUEST_PROC_FREE && p->state != GUEST_PROC_REAPED &&
+            p->machine == m) {
+          self = p;
+          break;
+        }
+      }
+    }
+    
+    /* Find next runnable process (round-robin) */
+    if (self && self->state == GUEST_PROC_RUNNABLE) {
+      nxt = self->next_runnable;
+      if (!nxt || nxt->state != GUEST_PROC_RUNNABLE) {
+        nxt = g_process_table.run_queue_head;
+        while (nxt && (nxt == self || nxt->state != GUEST_PROC_RUNNABLE)) {
+          nxt = nxt->next_runnable;
+        }
+      }
+      
+      /* Yield to next process if found (different from self) */
+      if (nxt && nxt != self && nxt->state == GUEST_PROC_RUNNABLE) {
+        m->interrupted = true;
+        g_process_table.current = nxt;
+        g_machine = nxt->machine;
+        return 0;
+      }
+    }
+  }
+  return 0;
+#else
 #ifdef HAVE_SCHED_YIELD
   return sched_yield();
 #else
   return 0;
+#endif
 #endif
 }
 

@@ -432,11 +432,22 @@ bool guest_proc_is_valid_transition(GuestProcState from, GuestProcState to) {
  * Generic state transition with strict validation.
  */
 int guest_proc_transition(struct GuestProcess *proc, GuestProcState new_state) {
+  GuestProcState old_state;
   if (!proc) return -EINVAL;
   if (!guest_proc_is_valid_transition(proc->state, new_state)) {
     return -EPERM; /* Illegal state transition rejected */
   }
+  
+  old_state = proc->state;
   proc->state = new_state;
+  
+  /* B8: Manage run queue membership based on state transitions */
+  if (old_state == GUEST_PROC_RUNNABLE && new_state != GUEST_PROC_RUNNABLE) {
+    proc_runq_remove(proc);
+  } else if (new_state == GUEST_PROC_RUNNABLE && old_state != GUEST_PROC_RUNNABLE) {
+    proc_runq_append(proc);
+  }
+  
   return 0;
 }
 
@@ -460,10 +471,9 @@ int guest_proc_exit(struct GuestProcess *proc, int status) {
 
   /* Detach Machine: CPU execution context ends, process identity remains */
   proc->machine = NULL;
-  proc_runq_remove(proc);
 
-  /* Transition to zombie */
-  proc->state = GUEST_PROC_ZOMBIE;
+  /* Transition to zombie (auto-removes from run queue if RUNNABLE) */
+  guest_proc_transition(proc, GUEST_PROC_ZOMBIE);
   proc->block_reason = BLOCK_NONE;
 
   /* Link into parent's zombie list if parent exists */
@@ -471,6 +481,21 @@ int guest_proc_exit(struct GuestProcess *proc, int status) {
   if (parent) {
     proc->next_zombie = parent->next_zombie;
     parent->next_zombie = proc;
+  }
+
+  /* B8: Wake any processes blocked in wait4() waiting for this child */
+  {
+    int i;
+    for (i = 0; i < MAX_GUEST_PROCESSES; i++) {
+      struct GuestProcess *waiter = &g_process_table.procs[i];
+      if (waiter->state == GUEST_PROC_BLOCKED &&
+          waiter->block_reason == BLOCK_WAIT4 &&
+          (waiter->block_pid == -1 || waiter->block_pid == proc->pid)) {
+        guest_proc_transition(waiter, GUEST_PROC_RUNNABLE);
+        waiter->block_reason = BLOCK_NONE;
+        waiter->block_pid = 0;
+      }
+    }
   }
 
   /* Clear current if the exiting process was active */
