@@ -49,6 +49,10 @@ struct Fd *AddFd(struct Fds *fds, int fildes, int oflags) {
       fd->cb = &kFdCbHost;
       fd->fildes = fildes;
       fd->oflags = oflags;
+      fd->ofd_refcount = (int *)malloc(sizeof(int));
+      if (fd->ofd_refcount) {
+        *fd->ofd_refcount = 1;
+      }
       unassert(!pthread_mutex_init(&fd->lock, 0));
       dll_make_first(&fds->list, &fd->elem);
     }
@@ -109,12 +113,37 @@ int CountFds(struct Fds *fds) {
   return n;
 }
 
-void FreeFd(struct Fd *fd) {
+int FreeFd(struct Fd *fd) {
+  int rc = 0;
   if (fd) {
+    bool should_close_host = false;
+    
+    /* B6: Decrement OFD refcount; close host FD only when last reference */
+    if (fd->ofd_refcount) {
+      (*fd->ofd_refcount)--;
+      if (*fd->ofd_refcount <= 0) {
+        should_close_host = true;
+        free(fd->ofd_refcount);
+      }
+    } else {
+      /* No refcount tracking - always close (legacy path) */
+      should_close_host = true;
+    }
+    
+    /* Close host FD if this is the last reference */
+    if (should_close_host && fd->cb) {
+      if (fd->dirstream) {
+        rc = VfsClosedir(fd->dirstream);
+      } else {
+        rc = fd->cb->close(fd->fildes);
+      }
+    }
+    
     unassert(!pthread_mutex_destroy(&fd->lock));
     free(fd->path);
     free(fd);
   }
+  return rc;
 }
 
 void DestroyFds(struct Fds *fds) {
@@ -157,4 +186,34 @@ void AddStdFd(struct Fds *fds, int fildes) {
   if ((flags = VfsFcntl(fildes, F_GETFL, 0)) >= 0) {
     InheritFd(AddFd(fds, fildes, flags));
   }
+}
+
+/* B6: Clone parent FD table to child with shared OFD refcounts.
+ * Each child Fd gets its own struct but shares ofd_refcount pointer with parent.
+ * This implements Unix fork() semantics: independent FD tables referencing
+ * the same underlying open file descriptions. */
+void CloneFds(struct Fds *child, struct Fds *parent) {
+  struct Dll *e;
+  struct Fd *parent_fd, *child_fd;
+  LOCK(&parent->lock);
+  for (e = dll_first(parent->list); e; e = dll_next(parent->list, e)) {
+    parent_fd = FD_CONTAINER(e);
+    child_fd = AddFd(child, parent_fd->fildes, parent_fd->oflags);
+    if (child_fd) {
+      /* Share the OFD refcount: increment it and point child to same counter */
+      if (parent_fd->ofd_refcount) {
+        free(child_fd->ofd_refcount);  /* Free the fresh one from AddFd */
+        child_fd->ofd_refcount = parent_fd->ofd_refcount;
+        (*child_fd->ofd_refcount)++;
+      }
+      /* Copy metadata */
+      if (parent_fd->path) {
+        child_fd->path = strdup(parent_fd->path);
+      }
+      child_fd->socktype = parent_fd->socktype;
+      child_fd->norestart = parent_fd->norestart;
+      memcpy(&child_fd->saddr, &parent_fd->saddr, sizeof(child_fd->saddr));
+    }
+  }
+  UNLOCK(&parent->lock);
 }

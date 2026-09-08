@@ -35,15 +35,9 @@
 #include "blink/vfs.h"
 
 static int CloseFd(struct Fd *fd) {
-  int rc;
   unassert(fd->cb);
-  if (fd->dirstream) {
-    rc = VfsClosedir(fd->dirstream);
-  } else {
-    rc = fd->cb->close(fd->fildes);
-  }
-  FreeFd(fd);
-  return rc;
+  /* B6: FreeFd handles OFD refcount decrement, host close on last ref, and struct cleanup */
+  return FreeFd(fd);
 }
 
 static int CloseFds(struct Dll *fds) {

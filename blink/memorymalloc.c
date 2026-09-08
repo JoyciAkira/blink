@@ -499,6 +499,8 @@ struct System *CloneSystemForFork(struct System *parent) {
   child->onromwriteattempt = parent->onromwriteattempt;
   child->exec = parent->exec;
   child->redraw = parent->redraw;
+  /* B6: Clone FD table with shared OFD refcounts */
+  CloneFds(&child->fds, &parent->fds);
   /* cr3 stays 0 from NewSystem; DeepCopyPageTables will populate it */
   return child;
 }

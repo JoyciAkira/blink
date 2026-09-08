@@ -38,6 +38,7 @@ struct Fd {
   pthread_mutex_t_ lock;
   const struct FdCb *cb;
   char *path;
+  int *ofd_refcount;  // B6: shared refcount for open file description
   union {
     struct sockaddr sa;
     struct sockaddr_in sin;
@@ -51,15 +52,15 @@ struct Fds {
 };
 
 extern const struct FdCb kFdCbHost;
-
 void InitFds(struct Fds *);
+void AddStdFd(struct Fds *, int);
+void CloneFds(struct Fds *child, struct Fds *parent);
 struct Fd *AddFd(struct Fds *, int, int);
 struct Fd *ForkFd(struct Fds *, struct Fd *, int, int);
 struct Fd *GetFd(struct Fds *, int);
 void LockFd(struct Fd *);
 void UnlockFd(struct Fd *);
-int CountFds(struct Fds *);
-void FreeFd(struct Fd *);
+int FreeFd(struct Fd *);
 void DestroyFds(struct Fds *);
 void InheritFd(struct Fd *);
 
