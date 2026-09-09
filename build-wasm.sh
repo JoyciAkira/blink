@@ -4,7 +4,7 @@
 
 set -euo pipefail
 
-BLINK_SRC="$HOME/tombl-build/blink"
+BLINK_SRC="$(cd "$(dirname "$0")" && pwd)"
 MUSL="$HOME/tombl-build/musl-install/usr/local/musl"
 COMPILER_RT="$HOME/tombl-build/compiler-rt-wasm/libcompiler_rt_wasm.a"
 OUTDIR="/tmp/blink-wasm-build"
@@ -45,25 +45,25 @@ echo "Total source files: ${#SRC_FILES[@]}"
 # Compile all source files (parallel)
 for src in "${SRC_FILES[@]}"; do
     echo "  CC  $src" >&2
-    clang $CFLAGS -c -o "$OUTDIR/$(basename "$src" .c).o" "$src" &
+    /opt/homebrew/opt/llvm/bin/clang $CFLAGS -c -o "$OUTDIR/$(basename "$src" .c).o" "$src" &
 done
 wait
 echo "All source files compiled."
 
  # Compile the wasm stubs for missing host functions
  echo "  CC  blink-wasm-stubs.c"
- clang $CFLAGS -c -o "$OUTDIR/blink-wasm-stubs.o" "blink-wasm-stubs.c" 2>&1
- 
+ /opt/homebrew/opt/llvm/bin/clang $CFLAGS -c -o "$OUTDIR/blink-wasm-stubs.o" "blink-wasm-stubs.c" 2>&1
+
  # Compile the fixed mmap shim
  echo "  CC  blink-wasm-mman-impl.c"
- clang $CFLAGS -c -o "$OUTDIR/blink-wasm-mman-impl.o" "blink-wasm-mman-impl.c" 2>&1
+ /opt/homebrew/opt/llvm/bin/clang $CFLAGS -c -o "$OUTDIR/blink-wasm-mman-impl.o" "blink-wasm-mman-impl.c" 2>&1
 
 # Count
 OBJ_COUNT=$(ls "$OUTDIR"/*.o 2>/dev/null | wc -l)
 echo ""
 echo "=== Linking blink.wasm ($OBJ_COUNT objects) ==="
 
-clang --target=wasm32 \
+/opt/homebrew/opt/llvm/bin/clang --target=wasm32 \
     -nostartfiles -nostdlib \
     "$OUTDIR"/*.o \
     "$MUSL/lib/crt1.o" \
