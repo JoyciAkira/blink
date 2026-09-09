@@ -4059,6 +4059,55 @@ static int SysExecve(struct Machine *m, i64 pa, i64 aa, i64 ea) {
       return 0; /* machine rewound; parent path resumes — do not exec here */
     fork_coalesce_abort();
   }
+  
+  /* Candidate B: pure GuestProcess exec (no pending fork-coalesce).
+   * Replace the current Machine's image in-place, preserving PID/PPID/FDs. */
+  if (g_process_table.initialized) {
+    struct GuestProcess *self = NULL;
+    int i;
+    if (g_process_table.current && g_process_table.current->machine == m) {
+      self = g_process_table.current;
+    } else {
+      for (i = 0; i < MAX_GUEST_PROCESSES; i++) {
+        struct GuestProcess *p = &g_process_table.procs[i];
+        if (p->state != GUEST_PROC_FREE && p->state != GUEST_PROC_REAPED &&
+            p->machine == m) {
+          self = p;
+          break;
+        }
+      }
+    }
+    if (self) {
+      char *execfn = prog;
+      sigset_t block;
+      sigfillset(&block);
+      unassert(!pthread_sigmask(SIG_BLOCK, &block, &m->system->exec_sigmask));
+      if (CanEmulateExecutable(m, &prog, &argv)) {
+        ERRF("B12-EXECVE: replacing image for pid=%d prog=%s", self->pid, prog);
+        
+        SysCloseExec(m->system);
+        ResetTimerDispositions(m->system);
+        ResetSignalDispositions(m->system);
+        
+        /* Free old virtual memory */
+        unassert(!FreeVirtual(m->system, -0x800000000000, 0x1000000000000));
+        
+        /* Load new program into the same Machine/System */
+        LoadProgram(m, execfn, prog, argv, envp, NULL);
+        
+        /* Restore signal mask */
+        unassert(!pthread_sigmask(SIG_SETMASK, &m->system->exec_sigmask, 0));
+        
+        /* The machine is now loaded with the new image. IP is at the entry point.
+         * Return 0 so OpSyscall exits normally and Actor resumes execution. */
+        m->interrupted = true; /* Prevent OpSyscall from overwriting rax with return value */
+        return 0;
+      }
+      unassert(!pthread_sigmask(SIG_SETMASK, &m->system->exec_sigmask, 0));
+      /* CanEmulateExecutable failed -> return -1 (ENOEXEC or similar) */
+      return -1;
+    }
+  }
 #endif
   LOCK(&m->system->exec_lock);
   ExecveBlink(m, prog, argv, envp);
