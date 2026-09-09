@@ -35,6 +35,7 @@
 #include "blink/macros.h"
 #include "blink/thread.h"
 #include "blink/vfs.h"
+#include "blink/guest-pipe.h"
 
 void InitFds(struct Fds *fds) {
   fds->list = 0;
@@ -49,6 +50,10 @@ struct Fd *AddFd(struct Fds *fds, int fildes, int oflags) {
       fd->cb = &kFdCbHost;
       fd->fildes = fildes;
       fd->oflags = oflags;
+      fd->ofd_refcount = (int *)malloc(sizeof(int));
+      if (fd->ofd_refcount) {
+        *fd->ofd_refcount = 1;
+      }
       unassert(!pthread_mutex_init(&fd->lock, 0));
       dll_make_first(&fds->list, &fd->elem);
     }
@@ -57,6 +62,26 @@ struct Fd *AddFd(struct Fds *fds, int fildes, int oflags) {
     einval();
     return 0;
   }
+}
+
+/* B7: Allocate a new Fd with the lowest available file descriptor number.
+ * Used for guest-side pipes/sockets that don't have a host fd backing. */
+struct Fd *AddFdAuto(struct Fds *fds, int oflags) {
+  int fildes = 0;
+  struct Dll *e;
+  /* Find lowest available fd number */
+  for (;;) {
+    bool used = false;
+    for (e = dll_first(fds->list); e; e = dll_next(fds->list, e)) {
+      if (FD_CONTAINER(e)->fildes == fildes) {
+        used = true;
+        break;
+      }
+    }
+    if (!used) break;
+    fildes++;
+  }
+  return AddFd(fds, fildes, oflags);
 }
 
 struct Fd *ForkFd(struct Fds *fds, struct Fd *fd, int fildes, int oflags) {
@@ -109,12 +134,40 @@ int CountFds(struct Fds *fds) {
   return n;
 }
 
-void FreeFd(struct Fd *fd) {
+int FreeFd(struct Fd *fd) {
+  int rc = 0;
   if (fd) {
+    bool should_close_host = false;
+    
+    /* B6: Decrement OFD refcount; close host FD only when last reference */
+    if (fd->ofd_refcount) {
+      (*fd->ofd_refcount)--;
+      if (*fd->ofd_refcount <= 0) {
+        should_close_host = true;
+        free(fd->ofd_refcount);
+      }
+    } else {
+      /* No refcount tracking - always close (legacy path) */
+      should_close_host = true;
+    }
+    
+    /* Close host FD if this is the last reference */
+    if (should_close_host && fd->cb) {
+      if (fd->dirstream) {
+        rc = VfsClosedir(fd->dirstream);
+      } else {
+        rc = fd->cb->close(fd->fildes);
+      }
+    }
+    
     unassert(!pthread_mutex_destroy(&fd->lock));
     free(fd->path);
+    if (fd->guest_data) {
+      GuestPipeReleaseData(fd->guest_data);
+    }
     free(fd);
   }
+  return rc;
 }
 
 void DestroyFds(struct Fds *fds) {
@@ -157,4 +210,40 @@ void AddStdFd(struct Fds *fds, int fildes) {
   if ((flags = VfsFcntl(fildes, F_GETFL, 0)) >= 0) {
     InheritFd(AddFd(fds, fildes, flags));
   }
+}
+
+/* B6: Clone parent FD table to child with shared OFD refcounts.
+ * Each child Fd gets its own struct but shares ofd_refcount pointer with parent.
+ * This implements Unix fork() semantics: independent FD tables referencing
+ * the same underlying open file descriptions. */
+void CloneFds(struct Fds *child, struct Fds *parent) {
+  struct Dll *e;
+  struct Fd *parent_fd, *child_fd;
+  LOCK(&parent->lock);
+  for (e = dll_first(parent->list); e; e = dll_next(parent->list, e)) {
+    parent_fd = FD_CONTAINER(e);
+    child_fd = AddFd(child, parent_fd->fildes, parent_fd->oflags);
+    if (child_fd) {
+      /* Share the OFD refcount: increment it and point child to same counter */
+      if (parent_fd->ofd_refcount) {
+        free(child_fd->ofd_refcount);  /* Free the fresh one from AddFd */
+        child_fd->ofd_refcount = parent_fd->ofd_refcount;
+        (*child_fd->ofd_refcount)++;
+      }
+      /* Copy metadata */
+      if (parent_fd->path) {
+        child_fd->path = strdup(parent_fd->path);
+      }
+      child_fd->socktype = parent_fd->socktype;
+      child_fd->norestart = parent_fd->norestart;
+      memcpy(&child_fd->saddr, &parent_fd->saddr, sizeof(child_fd->saddr));
+      /* B7: Inherit guest-side pipe callbacks and data */
+      child_fd->cb = parent_fd->cb;
+      if (parent_fd->guest_data) {
+        child_fd->guest_data = parent_fd->guest_data;
+        GuestPipeAcquireData(child_fd->guest_data);
+      }
+    }
+  }
+  UNLOCK(&parent->lock);
 }

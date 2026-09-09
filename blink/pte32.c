@@ -37,6 +37,7 @@ u64 LoadPte32_(const u8 *pte) {
 
 void StorePte32_(u8 *pte, u64 val) {
   LOCK(&g_ptelock);
+  G12NotePteWrite(pte, 0, val, 2, 1);
   Write64(pte, val);
   UNLOCK(&g_ptelock);
 }
@@ -50,6 +51,7 @@ bool CasPte32_(u8 *pte, u64 oldval, u64 newval) {
   } else {
     res = false;
   }
+  G12NotePteWrite(pte, oldval, res ? newval : oldval, 1, res);
   UNLOCK(&g_ptelock);
   return res;
 }

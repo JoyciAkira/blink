@@ -27,6 +27,7 @@
 #include "blink/dll.h"
 #include "blink/errno.h"
 #include "blink/fds.h"
+#include "blink/fork-coalesce.h"
 #include "blink/log.h"
 #include "blink/machine.h"
 #include "blink/syscall.h"
@@ -34,15 +35,9 @@
 #include "blink/vfs.h"
 
 static int CloseFd(struct Fd *fd) {
-  int rc;
   unassert(fd->cb);
-  if (fd->dirstream) {
-    rc = VfsClosedir(fd->dirstream);
-  } else {
-    rc = fd->cb->close(fd->fildes);
-  }
-  FreeFd(fd);
-  return rc;
+  /* B6: FreeFd handles OFD refcount decrement, host close on last ref, and struct cleanup */
+  return FreeFd(fd);
 }
 
 static int CloseFds(struct Dll *fds) {
@@ -63,6 +58,19 @@ static int FinishClose(struct Machine *m, int rc) {
 
 int SysClose(struct Machine *m, i32 fildes) {
   struct Fd *fd;
+#ifdef __wasm__
+  /* The synthetic child shares the parent's Blink fd table until exec.
+   * Defer its close to spawn_exec_entry; applying it here closes the
+   * parent's signal/stdout pipes and aborts posix_spawn before execve. */
+  if (g_fork_state.pending) {
+    LOCK(&m->system->fds.lock);
+    fd = GetFd(&m->system->fds, fildes);
+    UNLOCK(&m->system->fds.lock);
+    if (!fd) return ebadf();
+    fork_coalesce_add_fd_action(WASM_SPAWN_FD_CLOSE, fildes, 0);
+    return 0;
+  }
+#endif
   LOCK(&m->system->fds.lock);
   if ((fd = GetFd(&m->system->fds, fildes))) {
     dll_remove(&m->system->fds.list, &fd->elem);

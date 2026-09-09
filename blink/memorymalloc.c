@@ -17,6 +17,7 @@
 │ PERFORMANCE OF THIS SOFTWARE.                                                │
 ╚─────────────────────────────────────────────────────────────────────────────*/
 #include <stdlib.h>
+#include <time.h>
 #include <string.h>
 #include <sys/mman.h>
 #include <unistd.h>
@@ -33,6 +34,8 @@
 #include "blink/linux.h"
 #include "blink/log.h"
 #include "blink/machine.h"
+#include "blink/fork-coalesce.h"
+#include "blink/syscall.h"
 #include "blink/macros.h"
 #include "blink/map.h"
 #include "blink/pml4t.h"
@@ -46,9 +49,11 @@
 struct Allocator {
   pthread_mutex_t_ lock;
   struct HostPage *pages GUARDED_BY(lock);
+  struct HostPage *recycled GUARDED_BY(lock);
 } g_allocator = {
     PTHREAD_MUTEX_INITIALIZER_,
 };
+#define G12_HOSTPAGE_CAPACITY (1u << 20)
 
 struct Machine g_bssmachine;
 struct HostPages g_hostpages;
@@ -61,12 +66,29 @@ static void ClearPage(void *p) {
   FillPage(p, 0);
 }
 
-static struct HostPage *NewHostPage(void) {
+
+static struct HostPage *NewHostPageUnlocked(void) {
+  struct HostPage *h;
+  if ((h = g_allocator.recycled)) {
+    g_allocator.recycled = h->next;
+    return h;
+  }
   return (struct HostPage *)malloc(sizeof(struct HostPage));
 }
 
-static void FreeHostPage(struct HostPage *hp) {
-  free(hp);
+static struct HostPage *NewHostPage(void) {
+  struct HostPage *h;
+  LOCK(&g_allocator.lock);
+  h = NewHostPageUnlocked();
+  UNLOCK(&g_allocator.lock);
+  return h;
+}
+
+static void RecycleHostPage(struct HostPage *hp) {
+  LOCK(&g_allocator.lock);
+  hp->next = g_allocator.recycled;
+  g_allocator.recycled = hp;
+  UNLOCK(&g_allocator.lock);
 }
 
 static u64 TrackHostPage(u8 *ptr) {
@@ -74,14 +96,16 @@ static u64 TrackHostPage(u8 *ptr) {
   if (HasLinearMapping()) {
     return (uintptr_t)ptr;
   } else {
-    if (g_hostpages.n == g_hostpages.c) {
-      g_hostpages.c += 1;
-      g_hostpages.c += g_hostpages.c >> 1;
-      g_hostpages.p =
-          realloc(g_hostpages.p, g_hostpages.c * sizeof(*g_hostpages.p));
+    LOCK(&g_allocator.lock);
+    if (!g_hostpages.c) {
+      g_hostpages.c = G12_HOSTPAGE_CAPACITY;
+      unassert(g_hostpages.p = (u8 **)calloc(
+                   g_hostpages.c, sizeof(*g_hostpages.p)));
     }
+    unassert(g_hostpages.n < g_hostpages.c);
     entry = g_hostpages.n++;
     g_hostpages.p[entry] = ptr;
+    UNLOCK(&g_allocator.lock);
     return entry << 12;
   }
 }
@@ -119,7 +143,6 @@ void *AllocateBig(size_t n, int prot, int flags, int fd, off_t off) {
   void *p = Mmap(0, n, prot, flags, fd, off, "big");
   return p != MAP_FAILED ? p : 0;
 }
-
 static void FreePageTable(struct System *s, u8 *page) {
   FreeAnonymousPage(s, page);
   s->memstat.tables -= 1;
@@ -150,6 +173,17 @@ static bool FreeEmptyPageTables(struct System *s, u64 pt, long level) {
     }
   }
   if (isempty) {
+    /* G12-D4: detect freeing a page-table page that still holds a PAGE_LOCK
+     * — a syscall pins a pslot inside mi while this frees mi; the recycled
+     * page silently loses the lock bit. */
+    for (long j = 0; j < 512; ++j) {
+      u64 e2 = LoadPte(mi + j * 8);
+      if (e2 & PAGE_LOCKS) {
+        ERRF("M115-FREEPT mi=%p slot=%ld entry=%#llx locks=%d",
+             (void *)mi, j, (unsigned long long)e2,
+             (int)((e2 & PAGE_LOCKS) / PAGE_LOCK));
+      }
+    }
     FreePageTable(s, mi);
   }
   return isempty;
@@ -278,6 +312,23 @@ static void FreeMachineUnlocked(struct Machine *m) {
   }
 }
 
+struct Machine *GetMachineByHostThread(struct System *s) {
+  struct Dll *e;
+  struct Machine *m, *found = 0;
+  pthread_t self = pthread_self();
+  if (!s) return 0;
+  LOCK(&s->machines_lock);
+  for (e = dll_first(s->machines); e; e = dll_next(s->machines, e)) {
+    m = MACHINE_CONTAINER(e);
+    if (m->thread && pthread_equal(m->thread, self)) {
+      found = m;
+      break;
+    }
+  }
+  UNLOCK(&s->machines_lock);
+  return found;
+}
+
 bool IsOrphan(struct Machine *m) {
   bool res;
   LOCK(&m->system->machines_lock);
@@ -298,7 +349,22 @@ void KillOtherThreads(struct System *s) {
   struct Dll *e;
   struct Machine *m;
   struct timespec deadline;
+  struct Machine *selfm = GetMachineByHostThread(s);
+  ERRF("G12-KOT-ENTER killer_tid=%d sys_pid=%d selfm_tid=%d self=%p",
+       g_machine ? g_machine->tid : -1, s->pid, selfm ? selfm->tid : -1,
+       (void *)pthread_self());
+#ifdef __wasm__
+  /* N0D: a worker pthread must never KillOtherThreads. wasm _Thread_local
+   * g_machine can alias the leader; identify the caller by pthread_t. */
+  if (selfm && selfm->tid != s->pid) {
+    ERRF("G12-KOT-WORKER-REFUSE tid=%d -> SysExit; wake parent", selfm->tid);
+    fork_coalesce_wake_parent();
+    SysExit(selfm, 0);
+  }
+#endif
   if (atomic_exchange(&s->killer, true)) {
+    ERRF("G12-KOT-ALREADY killer_tid=%d -> pthread_exit",
+         g_machine ? g_machine->tid : -1);
     FreeMachine(g_machine);
     pthread_exit(EXIT_SUCCESS);
   }
@@ -309,12 +375,26 @@ StartOver:
     LOCK(&s->machines_lock);
     for (e = dll_first(s->machines); e; e = dll_next(s->machines, e)) {
       if ((m = MACHINE_CONTAINER(e)) != g_machine) {
+        int eqself = pthread_equal(m->thread, pthread_self());
+        int tgt_leader = (m->tid == s->pid);
+        int killer_worker = (g_machine->tid != s->pid);
         THR_LOGF("pid=%d tid=%d is killing tid %d", s->pid, g_machine->tid,
                  m->tid);
+        ERRF("G12-KOT-KILL killer_tid=%d tgt_tid=%d eqself=%d leader=%d try=%d sig=%s",
+             g_machine->tid, m->tid, eqself, tgt_leader, t,
+             t < 10 ? "SIGSYS" : "SIGKILL");
+        /* N0D C: a CLONE_THREAD worker must not mark/kill the process leader. */
+        if (killer_worker && tgt_leader) {
+          ERRF("G12-KOT-SKIP-LEADER killer_tid=%d tgt_tid=%d", g_machine->tid,
+               m->tid);
+          continue;
+        }
         atomic_store_explicit(&m->killed, true, memory_order_release);
         atomic_store_explicit(&m->attention, true, memory_order_release);
         if (t < 10) {
-          pthread_kill(m->thread, SIGSYS);
+          if (!eqself) pthread_kill(m->thread, SIGSYS);
+        } else if (eqself) {
+          ERRF("G12-KOT-NO-SELF-SIGKILL tgt_tid=%d", m->tid);
         } else {
           LOGF("kill9'd thread after 10 tries");
           pthread_kill(m->thread, SIGKILL);
@@ -372,11 +452,142 @@ void FreeSystem(struct System *s) {
   free(s);
 }
 
+/* B4: Clone a System for fork() with independent address space.
+ * Copies scalar config/state fields; allocates fresh cr3, mutexes, fds, jit.
+ * Does NOT copy page tables — caller must DeepCopyPageTables() after. */
+struct System *CloneSystemForFork(struct System *parent) {
+  struct System *child;
+  unassert(parent);
+  unassert(parent->mode.omode == XED_MODE_LONG);
+  child = NewSystem(parent->mode);
+  if (!child) return NULL;
+  /* Copy scalar configuration and state */
+  child->dlab = parent->dlab;
+  child->isfork = parent->isfork;
+  child->exited = false;
+  child->loaded = parent->loaded;
+  child->iscosmo = parent->iscosmo;
+  child->trapexit = parent->trapexit;
+  child->brkchanged = parent->brkchanged;
+  atomic_store_explicit(&child->killer, false, memory_order_relaxed);
+  child->gdt_limit = parent->gdt_limit;
+  child->idt_limit = parent->idt_limit;
+  child->exitcode = 0;
+  child->efer = parent->efer;
+  child->pid = parent->pid; /* will be overwritten by GuestProcess pid */
+  child->next_tid = 1;
+  child->gdt_base = parent->gdt_base;
+  child->idt_base = parent->idt_base;
+  child->cr0 = parent->cr0;
+  child->cr2 = parent->cr2;
+  child->cr4 = parent->cr4;
+  child->brk = parent->brk;
+  child->automap = parent->automap;
+  child->memchurn = 0;
+  child->codestart = parent->codestart;
+  child->codesize = parent->codesize;
+  atomic_store_explicit(&child->rss, 0, memory_order_relaxed);
+  atomic_store_explicit(&child->vss, 0, memory_order_relaxed);
+  memcpy(child->hands, parent->hands, sizeof(child->hands));
+  child->blinksigs = parent->blinksigs;
+  child->exec_sigmask = parent->exec_sigmask;
+  memcpy(child->rlim, parent->rlim, sizeof(child->rlim));
+  child->onfilemap = parent->onfilemap;
+  child->onsymbols = parent->onsymbols;
+  child->onbinbase = parent->onbinbase;
+  child->onlongbranch = parent->onlongbranch;
+  child->onromwriteattempt = parent->onromwriteattempt;
+  child->exec = parent->exec;
+  child->redraw = parent->redraw;
+  /* B6: Clone FD table with shared OFD refcounts */
+  CloneFds(&child->fds, &parent->fds);
+  /* cr3 stays 0 from NewSystem; DeepCopyPageTables will populate it */
+  return child;
+}
+
+/* B4: Deep-copy parent page tables into child System.
+ * Writable private pages (PAGE_HOST|PAGE_RW) get fresh host copies.
+ * Read-only and non-host pages share the same host backing.
+ * Allocates child cr3 and all intermediate page-table levels. */
+static int DeepCopyPageTablesLevel(struct System *child,
+                                   const struct System *parent,
+                                   u64 parent_pt, u64 child_pt,
+                                   unsigned level) {
+  u8 *parent_table, *child_table;
+  int i;
+  parent_table = GetPageAddress((struct System *)parent, parent_pt, level == 39);
+  child_table = GetPageAddress(child, child_pt, level == 39);
+  if (!parent_table || !child_table) return -1;
+  for (i = 0; i < 512; ++i) {
+    u64 pentry = Load64(parent_table + i * 8);
+    if (!(pentry & PAGE_V)) {
+      Store64(child_table + i * 8, 0);
+      continue;
+    }
+    if (level == 12) {
+      /* Leaf PTE */
+      if (pentry & PAGE_SHARED) {
+        /* MAP_SHARED mapping: always share as-is (B5 correctness) */
+        Store64(child_table + i * 8, pentry);
+      } else if (pentry & PAGE_HOST) {
+        /* Private page (writable OR read-only): deep-copy to prevent mprotect aliasing (B4 completeness) */
+        u64 new_pte = AllocateAnonymousPage(child);
+        if (new_pte == (u64)-1) return -1;
+        u8 *src = FindHostPage(pentry);
+        u8 *dst = FindHostPage(new_pte);
+        if (!src || !dst) return -1;
+        memcpy(dst, src, 4096);
+        /* Preserve original flags except host address */
+        new_pte |= (pentry & ~(u64)PAGE_TA);
+        Store64(child_table + i * 8, new_pte);
+      } else {
+        /* Non-host (e.g. code, RSRV): share as-is */
+        Store64(child_table + i * 8, pentry);
+      }
+    } else {
+      /* Non-leaf: allocate new page table for child, recurse */
+      if (pentry & PAGE_PS) {
+        /* Huge page at non-leaf level: share as-is (rare in guest) */
+        Store64(child_table + i * 8, pentry);
+      } else {
+        u64 new_child_pt = AllocatePageTable(child);
+        if (new_child_pt == (u64)-1) return -1;
+        int rc = DeepCopyPageTablesLevel(child, parent,
+                                         pentry,
+                                         new_child_pt,
+                                         level - 9);
+        if (rc) return rc;
+        /* Reconstruct non-leaf PTE with new child table address, keep flags */
+        u64 new_entry = (new_child_pt & PAGE_TA) | (pentry & ~PAGE_TA);
+        Store64(child_table + i * 8, new_entry);
+      }
+    }
+  }
+  return 0;
+}
+
+int DeepCopyPageTables(struct System *child, const struct System *parent) {
+  u64 child_cr3;
+  int rc;
+  unassert(child && parent);
+  unassert(!child->cr3); /* must be fresh from CloneSystemForFork */
+  child_cr3 = AllocatePageTable(child);
+  if (child_cr3 == (u64)-1) return -1;
+  child->cr3 = child_cr3;
+  rc = DeepCopyPageTablesLevel(child, parent,
+                               parent->cr3, child_cr3, 39);
+  if (rc) {
+    /* Partial failure: FreeSystem will clean up via FreeHostPages */
+    return rc;
+  }
+  return 0;
+}
+
 struct Machine *NewMachine(struct System *system, struct Machine *parent) {
   _Static_assert(IS2POW(kMaxThreadIds), "");
   struct Machine *m;
   unassert(system);
-  unassert(!parent || system == parent->system);
+  /* B4: relaxed for fork — child Machine may have a different System than parent */
   if (posix_memalign((void **)&m, _Alignof(struct Machine), sizeof(*m))) {
     enomem();
     return 0;
@@ -391,6 +602,7 @@ struct Machine *NewMachine(struct System *system, struct Machine *parent) {
     ResetInstructionCache(m);
     m->insyscall = false;
     m->nofault = false;
+    atomic_store_explicit(&m->g12_parked, false, memory_order_relaxed);
     m->sysdepth = 0;
     m->sigdepth = 0;
     m->signals = 0;
@@ -457,7 +669,7 @@ u64 AllocateAnonymousPage(struct System *s) {
     g_allocator.pages = h->next;
     UNLOCK(&g_allocator.lock);
     page = h->page;
-    FreeHostPage(h);
+    RecycleHostPage(h);
     goto Finished;
   } else {
     UNLOCK(&g_allocator.lock);
@@ -468,7 +680,7 @@ u64 AllocateAnonymousPage(struct System *s) {
   if (!page) return -1;
   LOCK(&g_allocator.lock);
   for (i = n; i-- > 1;) {
-    unassert((h = NewHostPage()));
+    unassert((h = NewHostPageUnlocked()));
     h->page = page + i * 4096;
     h->next = g_allocator.pages;
     g_allocator.pages = h;
@@ -484,7 +696,6 @@ Finished:
 u64 AllocatePageTable(struct System *s) {
   u64 res;
   if ((res = AllocateAnonymousPage(s)) != -1) {
-    s->memstat.tables += 1;
     res &= ~PAGE_U;
   }
   return res;
@@ -609,7 +820,7 @@ static void UnmarkFilePage(struct System *s, i64 virt) {
 }
 
 static void WaitForPageToNotBeLocked(struct System *s, i64 virt, u8 *pte) {
-  unassert(g_machine);
+  if (!g_machine) return;
 #ifdef DEBUG
   unassert(!IsOrphan(g_machine));
   unassert(!HasPageLock(g_machine, virt & -4096));
@@ -639,7 +850,14 @@ static bool FreePage(struct System *s, i64 virt, u64 entry, u64 size,
   if ((entry & (PAGE_HOST | PAGE_MAP | PAGE_MUG)) == PAGE_HOST) {
     unassert(~entry & PAGE_RSRV);
     s->memstat.committed -= 1;
-    ClearPage((page = FindHostPage(entry)));
+    u8 *hp = FindHostPage(entry);
+    if (entry & PAGE_LOCKS) {
+      ERRF("M115-CLEARLOCK page=%p entry=%#llx locks=%d",
+           (void *)hp, (unsigned long long)entry,
+           (int)((entry & PAGE_LOCKS) / PAGE_LOCK));
+    }
+    ClearPage(hp);
+    page = hp;
     FreeAnonymousPage(s, page);
     --*rss_delta;
     return false;
@@ -703,6 +921,7 @@ static void RemoveVirtual(struct System *s, i64 virt, i64 size,
   u8 *pp, *pde;
   unsigned pi, p1;
   unassert(!(virt & 4095));
+  G12NoteTargetUnmap(s, (u64)virt, (u64)size);
   MEM_LOGF("RemoveVirtual(%#" PRIx64 ", %#" PRIx64 ")", virt, size);
   for (pde = 0, end = virt + size; virt < end; virt += (u64)1 << i) {
     for (pt = s->cr3, i = 39;; i -= 9) {
@@ -931,6 +1150,7 @@ i64 ReserveVirtual(struct System *s, i64 virt, i64 size, u64 flags, int fd,
     vss_delta += pages;
     s->memstat.reserved += pages;
     flags |= PAGE_HOST | PAGE_MAP | PAGE_MUG | PAGE_RSRV;
+    if (shared) flags |= PAGE_SHARED;
   } else {
     flags |= PAGE_RSRV;
     vss_delta += pages;
@@ -1007,6 +1227,7 @@ i64 ReserveVirtual(struct System *s, i64 virt, i64 size, u64 flags, int fd,
             unassert(pt & PAGE_V);
             WaitForPageToNotBeLocked(s, virt, mi);
           } else if (CasPte(mi, pt, entry)) {
+            G12CapturePagePath(s, (u64)virt, true);
             break;
           }
         }
@@ -1196,6 +1417,8 @@ int ProtectVirtual(struct System *s, i64 virt, i64 size, int prot,
     unassert(!hostonly);  // caller should know better
     sysprot = PROT_READ | PROT_WRITE;
   }
+  G12NoteTargetMprotect(s, (u64)orig_virt, (u64)size, prot, sysprot,
+                        hostonly);
   memset(&ranges, 0, sizeof(ranges));
   executable_code_was_made_non_executable = false;
   for (rc = 0, end = virt + size;;) {
@@ -1230,7 +1453,9 @@ int ProtectVirtual(struct System *s, i64 virt, i64 size, int prot,
         if (!hostonly) {
           for (;;) {
             pt2 = (pt & ~(PAGE_U | PAGE_RW | PAGE_XD)) | key;
-            if (CasPte(mi, pt, pt2)) break;
+            if (CasPte(mi, pt, pt2)) {
+              break;
+            }
             pt = LoadPte(mi);
             if (!(pt & PAGE_V)) {
               goto MemoryDisappeared;

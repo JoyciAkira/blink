@@ -33,7 +33,6 @@
 #include "blink/endian.h"
 #include "blink/flag.h"
 #include "blink/fork-coalesce.h"
-#include "blink/guest-process.h"
 #include "blink/jit.h"
 #include "blink/loader.h"
 #include "blink/log.h"
@@ -155,8 +154,9 @@ void TerminateSignal(struct Machine *m, int sig, int code) {
   ERRF("G12-INITIAL-SIGNAL sig=%s code=%d rip=%#" PRIx64 " faultaddr=%#" PRIx64 " tid=%d",
        DescribeSignal(sig), code, m ? m->ip : 0, m ? m->faultaddr : 0, m ? m->tid : -1);
 #ifdef __wasm__
-  /* N0D: leftover CLONE_THREAD worker taking a fatal guest signal must not
-   * KillOtherThreads the leader or kill(getpid()). SysExit clears ctid. */
+  /* N0D: a leftover CLONE_THREAD worker taking a fatal guest signal must not
+   * KillOtherThreads the leader or kill(getpid()). pthread_exit without
+   * ClearChildTid leaves the leader blocked in join. SysExit clears ctid. */
   if (m && m->tid != m->system->pid && !IsOrphan(m)) {
     ERRF("G12-SIGILL-INST: %s", DescribeOp(m, m->ip));
     ERRF("G12-TERMSIG-DEMOTE tid=%d sig=%s -> SysExit; wake parent", m->tid,
@@ -230,10 +230,6 @@ static int Exec(char *execfn, char *prog, char **argv, char **envp) {
   m->system->exec = Exec;
   if (!old) {
     // this is the first time a program is being loaded
-    guest_proc_init_first(m, 1);
-    unassert(g_process_table.current != NULL);
-    unassert(g_process_table.current->machine == m);
-    unassert(g_process_table.current->pid == 1);
     LoadProgram(m, execfn, prog, argv, envp, NULL);
     SetupCod(m);
     for (i = 0; i < 10; ++i) {
@@ -245,9 +241,6 @@ static int Exec(char *execfn, char *prog, char **argv, char **envp) {
     DisableJit(&old->system->jit);  // unmapping exec pages is slow
 #endif
     unassert(!m->sysdepth);
-    if (g_process_table.current) {
-      g_process_table.current->machine = m;
-    }
     unassert(!m->pagelocks.i);
     unassert(!FreeVirtual(old->system, -0x800000000000, 0x1000000000000));
     for (i = 1; i <= 64; ++i) {
@@ -306,122 +299,5 @@ static void GetOpts(int argc, char *argv[]) {
         break;
       case 'j':
         FLAG_nojit = true;
-        break;
-      case 's':
-        ++FLAG_strace;
-        break;
-      case 'm':
-        FLAG_nolinear = true;
-        break;
-      case 'Z':
-        FLAG_statistics = true;
-        break;
-      case 'e':
-        FLAG_alsologtostderr = true;
-        break;
-      case 'L':
-        FLAG_logpath = optarg_;
-        break;
-      case 'C':
-#if !defined(DISABLE_OVERLAYS)
-        FLAG_overlays = optarg_;
-#elif !defined(DISABLE_VFS)
-        FLAG_prefix = optarg_;
-#else
-        WriteErrorString(
-            "error: overlays and vfs support were both disabled\n");
-#endif
-        break;
-      case 'v':
-        PrintVersion();
-      case 'h':
-        PrintUsage(argc, argv, 0, 1);
-      default:
-        PrintUsage(argc, argv, 48, 2);
-    }
-  }
-#if LOG_ENABLED
-  LogInit(FLAG_logpath);
-#endif
-}
 
-static void HandleSigs(void) {
-  struct sigaction sa;
-  signal(SIGPIPE, SIG_IGN);
-  sigfillset(&sa.sa_mask);
-  sa.sa_flags = 0;
-#ifdef HAVE_THREADS
-  sa.sa_handler = OnSigSys;
-  unassert(!sigaction(SIGSYS, &sa, 0));
-#endif
-  sa.sa_sigaction = OnSignal;
-  unassert(!sigaction(SIGINT, &sa, 0));
-  unassert(!sigaction(SIGQUIT, &sa, 0));
-  unassert(!sigaction(SIGHUP, &sa, 0));
-  unassert(!sigaction(SIGTERM, &sa, 0));
-  unassert(!sigaction(SIGXCPU, &sa, 0));
-  unassert(!sigaction(SIGXFSZ, &sa, 0));
-#if !defined(__SANITIZE_THREAD__) && !defined(__SANITIZE_ADDRESS__) && \
-    !defined(__FILC__)
-  sa.sa_sigaction = OnFatalSystemSignal;
-  sa.sa_flags = SA_SIGINFO;
-  unassert(!sigaction(SIGBUS, &sa, 0));
-  unassert(!sigaction(SIGILL, &sa, 0));
-  unassert(!sigaction(SIGTRAP, &sa, 0));
-  unassert(!sigaction(SIGSEGV, &sa, 0));
-#endif
-}
-
-#if defined(__EMSCRIPTEN__)
-void exit(int status) {
-  // main is called multiple times - don't perform cleanup
-  _exit(status);
-}
-#endif
-
-int main(int argc, char *argv[]) {
-  SetupWeb();
-  GetStartDir();
-#ifndef NDEBUG
-  AtAbort(PrintStats);
-#endif
-#ifndef DISABLE_STRACE
-  setlocale(LC_ALL, "");
-#endif
-  // Ensure utf-8 is printed correctly on windows, this method
-  // has issues(http://stackoverflow.com/a/10884364/4279) but
-  // should work for at least windows 7 and newer.
-#if defined(_WIN32) && !defined(__CYGWIN__)
-  SetConsoleOutputCP(CP_UTF8);
-#endif
-  g_blink_path = argc > 0 ? argv[0] : 0;
-  WriteErrorInit();
-  InitMap();
-  GetOpts(argc, argv);
-  if (optind_ == argc) {
-    PrintUsage(argc, argv, 48, 2);
-  }
-#ifndef DISABLE_OVERLAYS
-  if (SetOverlays(FLAG_overlays, true)) {
-    WriteErrorString("bad blink overlays spec; see log for details\n");
-    exit(EXIT_FAILURE);
-  }
-#endif
-#ifndef DISABLE_VFS
-  if (VfsInit(FLAG_prefix)) {
-    WriteErrorString("error: vfs initialization failed\n");
-    exit(EXIT_FAILURE);
-  }
-#endif
-  HandleSigs();
-  InitBus();
-  if (!Commandv(argv[optind_], g_pathbuf, sizeof(g_pathbuf))) {
-    WriteErrorString(argv[0]);
-    WriteErrorString(": command not found: ");
-    WriteErrorString(argv[optind_]);
-    WriteErrorString("\n");
-    exit(EXIT_FAILURE_EXEC_FAILED);
-  }
-  argv[optind_] = g_pathbuf;
-  return Exec(g_pathbuf, g_pathbuf, argv + optind_ + FLAG_zero, environ);
-}
+[Showing lines 1-300 of 420. Use :301 to continue]

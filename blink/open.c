@@ -30,6 +30,7 @@
 #include "blink/errno.h"
 #include "blink/fds.h"
 #include "blink/fspath.h"
+#include "blink/fork-coalesce.h"
 #include "blink/log.h"
 #include "blink/overlays.h"
 #include "blink/random.h"
@@ -121,6 +122,20 @@ int SysOpenat(struct Machine *m, i32 dirfildes, i64 pathaddr, i32 oflags,
   if ((sysflags = XlatOpenFlags(oflags)) == -1) return -1;
   if (!(lim = GetFileDescriptorLimit(m->system))) return emfile();
   if (!(path = LoadStr(m, pathaddr))) return -1;
+#ifdef __wasm__
+  if (g_fork_state.pending) {
+    for (fildes = 0; fildes < lim; ++fildes) {
+      bool parent_open;
+      LOCK(&m->system->fds.lock);
+      parent_open = GetFd(&m->system->fds, fildes) != NULL;
+      UNLOCK(&m->system->fds.lock);
+      if (!fork_coalesce_fd_is_open(fildes, parent_open)) break;
+    }
+    if (fildes == lim) return emfile();
+    fork_coalesce_add_open_action(path, sysflags, mode, fildes);
+    return fildes;
+  }
+#endif
   RESTARTABLE(fildes = VfsOpen(GetDirFildes(dirfildes), path, sysflags, mode));
   if (fildes != -1) {
     if (fildes >= lim) {

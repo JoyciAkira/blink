@@ -92,8 +92,8 @@
 #define PAGE_V     0x0000000000000001  // valid
 #define PAGE_RW    0x0000000000000002  // writeable
 #define PAGE_U     0x0000000000000004  // permit ring3 access or read protect
+#define PAGE_SHARED 0x0000000000000020  // MAP_SHARED mapping (shared across fork)
 #define PAGE_PS    0x0000000000000080  // IsPage (PDPTE/PDE) or PAT (PT)
-#define PAGE_G     0x0000000000000100  // global
 #define PAGE_RSRV  0x0000000000000200  // PAGE_TA bits havent been chosen yet
 #define PAGE_HOST  0x0000000000000400  // PAGE_TA bits point to system memory
 #define PAGE_MAP   0x0000000000000800  // PAGE_TA bits are a linear host mmap
@@ -175,6 +175,8 @@ struct PageLock {
   i64 page;
   u8 *pslot;
   int sysdepth;
+  u64 entry;      /* PTE value at RecordPageLock time (valid+locked) */
+  u64 rec_seq;    /* global RecordPageLock sequence id */
 };
 
 struct SmcQueue {
@@ -425,12 +427,14 @@ struct Machine {               //
   int sigdepth;                          //
   int sysdepth;                          //
   _Atomic(bool) killed;                  // [attention] slay this thread
+  _Atomic(bool) g12_parked;              // N0D: sibling parked for fake-fork
   _Atomic(bool) invalidated;             // the tlb must be flushed
   bool restored;                         // [attention] rt_sigreturn()'d
   bool selfmodifying;                    // [attention] need usmc restore
   bool reserving;                        //
   bool insyscall;                        //
   bool nofault;                          //
+  bool g12_holds_serializer;             // [G12] released in OpSyscall epilogue
   bool canhalt;                          //
   bool metal;                            //
   bool interrupted;                      //
@@ -463,6 +467,7 @@ void FreeSystem(struct System *);
 void SignalActor(struct Machine *);
 void SetMachineMode(struct Machine *, struct XedMachineMode);
 struct Machine *NewMachine(struct System *, struct Machine *);
+struct Machine *GetMachineByHostThread(struct System *);
 i64 AreAllPagesUnlocked(struct System *) nosideeffect;
 bool IsOrphan(struct Machine *) nosideeffect;
 _Noreturn void Blink(struct Machine *);
@@ -482,6 +487,8 @@ int LoadInstruction2(struct Machine *, u64);
 void ExecuteInstruction(struct Machine *);
 u64 AllocatePageTable(struct System *);
 u64 AllocateAnonymousPage(struct System *);
+struct System *CloneSystemForFork(struct System *parent);
+int DeepCopyPageTables(struct System *child, const struct System *parent);
 void FreeAnonymousPage(struct System *, u8 *);
 u64 FindPageTableEntry(struct Machine *, u64);
 bool CheckMemoryInvariants(struct System *) nosideeffect dontdiscard;
@@ -524,6 +531,10 @@ u8 *BeginStoreNp(struct Machine *, i64, size_t, void *[2], u8 *);
 int GetFileDescriptorLimit(struct System *);
 bool HasPageLock(const struct Machine *, i64) nosideeffect;
 void CollectPageLocks(struct Machine *);
+void CollectPageLocksForce(struct Machine *);
+void G12CapturePagePath(struct System *, u64, bool);
+void G12NoteTargetMprotect(struct System *, u64, u64, int, int, bool);
+void G12NoteTargetUnmap(struct System *, u64, u64);
 u8 *LookupAddress(struct Machine *, i64);
 u8 *LookupAddress2(struct Machine *, i64, u64, u64);
 u8 *SpyAddress(struct Machine *, i64);
