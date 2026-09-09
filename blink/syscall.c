@@ -34,7 +34,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef __linux__
 #include <sys/eventfd.h>
+#endif
 #include <sys/file.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
@@ -2481,6 +2483,7 @@ static int SysGetsockopt(struct Machine *m, i32 fildes, i32 level, i32 optname,
   return rc;
 }
 
+#ifdef __linux__
 /* ── T5O: Linux signalfd / signalfd4 (guest-virtual, host-eventfd substrate)─
  *
  * Guest semantics per Linux: object created with a signal mask; readable when
@@ -2630,8 +2633,16 @@ static i64 SysSignalfd4(struct Machine *m, i64 gfd, i64 maskaddr,
   ERRF("[T5O] CREATED hostfd=%d mask=%#llx", hostfd, (unsigned long long)mask);
   return hostfd;
 }
+#else /* !__linux__ */
+void SignalfdNotifyOnSignal(int sig) { (void)sig; }
+static i64 SysSignalfd4(struct Machine *m, i64 gfd, i64 maskaddr,
+                        i64 sigsetsize, u64 flags) {
+  (void)m; (void)gfd; (void)maskaddr; (void)sigsetsize; (void)flags;
+  return einval();
+}
+#endif /* __linux__ */
 
-
+#ifdef __linux__
 static i64 SysSignalfdRead(struct Machine *m, i32 fildes, i64 addr, u64 size) {
   struct SignalFdEntry *e = SignalfdFind(fildes);
   if (!e) return ebadf();
@@ -2683,6 +2694,7 @@ static i64 SysSignalfdRead(struct Machine *m, i32 fildes, i64 addr, u64 size) {
   }
   return (i64)(records * 128);
 }
+#endif /* __linux__ */
 static i64 SysRead(struct Machine *m, i32 fildes, i64 addr, u64 size) {
   i64 rc;
   int oflags;
@@ -2701,7 +2713,9 @@ static i64 SysRead(struct Machine *m, i32 fildes, i64 addr, u64 size) {
   }
   UNLOCK(&m->system->fds.lock);
   if (!fd) return -1;
+#ifdef __linux__
   if (fd->cb == &kFdCbSignal) return SysSignalfdRead(m, fildes, addr, size);
+#endif
   if ((oflags & O_ACCMODE) == O_WRONLY) return ebadf();
   if (size) {
     InitIovs(&iv);
@@ -4169,6 +4183,10 @@ static int SysWait4(struct Machine *m, int pid, i64 opt_out_wstatus_addr,
             }
           }
         }
+      } else {
+        /* B9: No matching guest children exist (all reaped or never created).
+         * Return -ECHILD (-10) immediately instead of falling through. */
+        return -ECHILD_LINUX;
       }
     }
   }
@@ -5951,6 +5969,7 @@ static int SysPipe(struct Machine *m, i64 pipefds_addr) {
 
 #ifdef HAVE_EPOLL_PWAIT1
 
+#ifdef __linux__
 static i32 SysEventfd2(struct Machine *m, u32 initval, i32 flags) {
   int lim, fildes, oflags, sysflags;
   oflags = 0;
@@ -5987,6 +6006,12 @@ static i32 SysEventfd2(struct Machine *m, u32 initval, i32 flags) {
   }
   return fildes;
 }
+#else /* !__linux__ */
+static i32 SysEventfd2(struct Machine *m, u32 initval, i32 flags) {
+  (void)m; (void)initval; (void)flags;
+  return einval();
+}
+#endif /* __linux__ */
 
 static i32 SysEpollCreate1(struct Machine *m, i32 flags) {
   int lim, fildes, oflags, sysflags;

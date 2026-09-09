@@ -469,8 +469,7 @@ int guest_proc_exit(struct GuestProcess *proc, int status) {
   proc->exit_status = status;
   proc->child_exited = true;
 
-  /* Detach Machine: CPU execution context ends, process identity remains */
-  proc->machine = NULL;
+  /* B9: Keep machine pointer alive — resources freed at reap time by parent */
 
   /* Transition to zombie (auto-removes from run queue if RUNNABLE) */
   guest_proc_transition(proc, GUEST_PROC_ZOMBIE);
@@ -510,11 +509,13 @@ int guest_proc_exit(struct GuestProcess *proc, int status) {
  * Process reap implementation:
  * - Only ZOMBIE processes may be reaped.
  * - Unlinks from parent's zombie chain.
+ * - B9: Frees child Machine and System resources (deep-copied memory, FD tables).
  * - Transitions to GUEST_PROC_REAPED then GUEST_PROC_FREE.
  * - Frees process slot and decrements table count.
  */
 int guest_proc_reap(struct GuestProcess *proc) {
   struct GuestProcess *parent;
+  struct Machine *child_m;
 
   if (!proc) return -EINVAL;
   if (proc->state != GUEST_PROC_ZOMBIE) {
@@ -541,6 +542,14 @@ int guest_proc_reap(struct GuestProcess *proc) {
   proc->state = GUEST_PROC_REAPED;
   proc->next_zombie = NULL;
 
+  /* B9: Free child execution resources (Machine and System) */
+  child_m = proc->machine;
+  if (child_m) {
+    ERRF("B9-REAP pid=%d FreeMachine", proc->pid);
+    FreeMachine(child_m); /* FreeMachine handles System teardown automatically */
+    proc->machine = NULL;
+  }
+
   /* Release table slot for recycling */
   proc_runq_remove(proc);
   proc->state = GUEST_PROC_FREE;
@@ -552,7 +561,6 @@ int guest_proc_reap(struct GuestProcess *proc) {
 
   return 0;
 }
-
 /*
  * Diagnostic introspection
  */
