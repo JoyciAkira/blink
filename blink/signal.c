@@ -76,8 +76,15 @@ void DeliverSignal(struct Machine *m, int sig, int code) {
       sig == SIGTRAP_LINUX) {
     Write64(sf.si.addr, m->faultaddr);
     SYS_LOGF("delivering %s {.si_code = %d, .si_addr = %#" PRIx64
-             ", .si_rip = %#" PRIx64 ", .si_sp = %#" PRIx64 "}",
-             DescribeSignal(sig), code, m->faultaddr, m->ip, m->sp);
+             ", .si_rip = %#" PRIx64 ", .si_sp = %#" PRIx64
+             ", .ax = %#" PRIx64 ", .bx = %#" PRIx64
+             ", .cx = %#" PRIx64 ", .dx = %#" PRIx64
+             ", .di = %#" PRIx64 ", .si = %#" PRIx64
+             ", .bp = %#" PRIx64 "}",
+             DescribeSignal(sig), code, m->faultaddr, m->ip, m->sp,
+             Read64(m->ax), Read64(m->bx), Read64(m->cx),
+             Read64(m->dx), Read64(m->di), Read64(m->si),
+             Read64(m->bp));
   } else {
     SYS_LOGF("delivering %s, {.si_code = %d}", DescribeSignal(sig), code);
     if (sig == SIGTRAP_LINUX) {

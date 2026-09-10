@@ -282,6 +282,28 @@ u8 *LookupAddress2(struct Machine *m, i64 virt, u64 mask, u64 need) {
              " mask=%#" PRIx64 " need=%#" PRIx64
              " rip=%#" PRIx64 " sp=%#" PRIx64,
              (u64)virt, entry, mask, need, m->ip, m->sp);
+    SYS_LOGF("SEGV_REGS ax=%#" PRIx64 " bx=%#" PRIx64 " cx=%#" PRIx64
+             " dx=%#" PRIx64 " di=%#" PRIx64 " si=%#" PRIx64
+             " bp=%#" PRIx64 " r8=%#" PRIx64 " r9=%#" PRIx64
+             " r10=%#" PRIx64 " r11=%#" PRIx64 " r12=%#" PRIx64,
+             Read64(m->ax), Read64(m->bx), Read64(m->cx),
+             Read64(m->dx), Read64(m->di), Read64(m->si),
+             Read64(m->bp), Read64(m->r8), Read64(m->r9),
+             Read64(m->r10), Read64(m->r11), Read64(m->r12));
+    {
+      u8 *host = GetPageAddress(m->system, entry, false);
+      if (host) {
+        u8 *p = host + ((u64)virt & 4095);
+        SYS_LOGF("SEGV_MEM@virt: %02x%02x%02x%02x%02x%02x%02x%02x"
+                 " %02x%02x%02x%02x%02x%02x%02x%02x"
+                 " %02x%02x%02x%02x%02x%02x%02x%02x"
+                 " %02x%02x%02x%02x%02x%02x%02x%02x",
+                 p[0],p[1],p[2],p[3],p[4],p[5],p[6],p[7],
+                 p[8],p[9],p[10],p[11],p[12],p[13],p[14],p[15],
+                 p[16],p[17],p[18],p[19],p[20],p[21],p[22],p[23],
+                 p[24],p[25],p[26],p[27],p[28],p[29],p[30],p[31]);
+      }
+    }
     m->segvcode = SEGV_ACCERR_LINUX;
     return (u8 *)efault0();
   }
