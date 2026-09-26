@@ -5714,9 +5714,9 @@ void OpSyscall(P) {
 #ifndef DISABLE_NONPOSIX
     SYSCALL(0, 0x03A, "vfork", SysVfork, STRACE_VFORK);
 #endif
+#endif /* HAVE_FORK */
     SYSCALL(4, 0x03D, "wait4", SysWait4, STRACE_WAIT4);
     SYSCALL(2, 0x03E, "kill", SysKill, STRACE_KILL);
-#endif /* HAVE_FORK */
 #ifdef HAVE_THREADS
     SYSCALL(6, 0x0CA, "futex", SysFutex, STRACE_FUTEX);
 #endif
