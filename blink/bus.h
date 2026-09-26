@@ -73,7 +73,9 @@ bool CasPte32_(u8 *, u64, u64);
 void StorePte32_(u8 *, u64);
 
 nosideeffect static inline u64 LoadPte(const u8 *pte) {
-#if CAN_64BIT
+#if defined(__wasm__)
+  return Little64(__atomic_load_n((const u64 *)pte, __ATOMIC_ACQUIRE));
+#elif CAN_64BIT
   return Little64(
       atomic_load_explicit((_Atomic(u64) *)pte, memory_order_acquire));
 #else
@@ -82,7 +84,9 @@ nosideeffect static inline u64 LoadPte(const u8 *pte) {
 }
 
 static inline void StorePte(u8 *pte, u64 val) {
-#if CAN_64BIT
+#if defined(__wasm__)
+  __atomic_store_n((u64 *)pte, Little64(val), __ATOMIC_RELEASE);
+#elif CAN_64BIT
   atomic_store_explicit((_Atomic(u64) *)pte, Little64(val),
                         memory_order_release);
 #else
@@ -91,7 +95,12 @@ static inline void StorePte(u8 *pte, u64 val) {
 }
 
 static inline bool CasPte(u8 *pte, u64 oldval, u64 newval) {
-#if CAN_64BIT
+#if defined(__wasm__)
+  oldval = Little64(oldval);
+  return __atomic_compare_exchange_n(
+      (u64 *)pte, &oldval, Little64(newval), false,
+      __ATOMIC_RELEASE, __ATOMIC_RELAXED);
+#elif CAN_64BIT
   oldval = Little64(oldval);
   return atomic_compare_exchange_strong_explicit(
       (_Atomic(u64) *)pte, &oldval, Little64(newval),  //

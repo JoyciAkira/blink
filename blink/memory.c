@@ -149,13 +149,48 @@ static bool RecordPageLock(struct Machine *m, i64 page, u8 *pslot) {
   return true;
 }
 
-static void ReleasePageLock(u8 *pslot) {
+static uint64_t g_pagelock_seq;
+
+static void ReleasePageLock(struct Machine *m, i64 page, u8 *pslot) {
   u64 entry;
+  uint64_t seq = __atomic_fetch_add(&g_pagelock_seq, 1, __ATOMIC_RELAXED);
   do {
     entry = LoadPte(pslot);
+    if (UNLIKELY(!(entry & PAGE_V))) {
+      u8 *curr_pslot = NULL;
+      u64 curr_entry = 0;
+      u64 cr3 = m->system ? m->system->cr3 : 0;
+      if (cr3) {
+        curr_entry = cr3;
+        unsigned lvl = 39;
+        do {
+          unsigned idx = (page >> lvl) & 511;
+          curr_pslot = GetPageAddress(m->system, curr_entry, lvl == 39) + idx * 8;
+          if (!curr_pslot) { curr_pslot = NULL; break; }
+          curr_entry = LoadPte(curr_pslot);
+          if (!(curr_entry & PAGE_V)) break;
+          if ((curr_entry & PAGE_PS) && lvl > 12) break;
+        } while ((lvl -= 9) >= 12);
+      }
+      if (curr_pslot != pslot) {
+        fprintf(stderr, "[PAGELOCK_FAIL:STALE_PSLOT] seq=%llu tid=%d sysdepth=%d cr3=%#"PRIx64" page=%#"PRIx64" recorded_pslot=%p recorded_pte=%#"PRIx64" curr_pslot=%p curr_pte=%#"PRIx64"\n",
+                (unsigned long long)seq, m->tid, m->sysdepth, cr3, page, pslot, entry, curr_pslot, curr_entry);
+      } else if (!(curr_entry & PAGE_V)) {
+        fprintf(stderr, "[PAGELOCK_FAIL:LOCK_PROTOCOL_BYPASS] seq=%llu tid=%d sysdepth=%d cr3=%#"PRIx64" page=%#"PRIx64" pslot=%p recorded_pte=%#"PRIx64" (PAGE_V=0, locks=%d)\n",
+                (unsigned long long)seq, m->tid, m->sysdepth, cr3, page, pslot, entry, (int)(entry & PAGE_LOCKS));
+      } else if (!(entry & PAGE_LOCKS)) {
+        fprintf(stderr, "[PAGELOCK_FAIL:LOCK_ACCOUNTING_CORRUPTION] seq=%llu tid=%d sysdepth=%d cr3=%#"PRIx64" page=%#"PRIx64" pslot=%p pte=%#"PRIx64" (PAGE_V=1, locks=0)\n",
+                (unsigned long long)seq, m->tid, m->sysdepth, cr3, page, pslot, entry);
+      } else {
+        fprintf(stderr, "[PAGELOCK_FAIL:OTHER] seq=%llu tid=%d sysdepth=%d cr3=%#"PRIx64" page=%#"PRIx64" pslot=%p recorded_pte=%#"PRIx64" curr_pte=%#"PRIx64"\n",
+                (unsigned long long)seq, m->tid, m->sysdepth, cr3, page, pslot, entry, curr_entry);
+      }
+    }
     unassert(entry & PAGE_V);
     unassert(entry & PAGE_LOCKS);
   } while (!CasPte(pslot, entry, entry - PAGE_LOCK));
+  LOGF("[PAGELOCK_RELEASE] seq=%llu tid=%d sysdepth=%d page=%#"PRIx64" pslot=%p entry=%#"PRIx64,
+       (unsigned long long)seq, m->tid, m->sysdepth, page, pslot, entry);
 }
 
 static bool HasOutdatedPageLocks(struct Machine *m) {
@@ -166,8 +201,10 @@ static bool HasOutdatedPageLocks(struct Machine *m) {
 void CollectPageLocks(struct Machine *m) {
   if (HasOutdatedPageLocks(m)) {
     LOCK(&m->system->pagelocks_lock);
-    do ReleasePageLock(m->pagelocks.p[--m->pagelocks.i].pslot);
-    while (HasOutdatedPageLocks(m));
+    do {
+      --m->pagelocks.i;
+      ReleasePageLock(m, m->pagelocks.p[m->pagelocks.i].page, m->pagelocks.p[m->pagelocks.i].pslot);
+    } while (HasOutdatedPageLocks(m));
     unassert(!pthread_cond_broadcast(&m->system->pagelocks_cond));
     UNLOCK(&m->system->pagelocks_lock);
   }
@@ -235,10 +272,13 @@ TryAgain:
     if ((entry & PAGE_LOCKS) < PAGE_LOCKS) {
       if (CasPte(pslot, entry, entry + PAGE_LOCK)) {
         unassert(LoadPte(pslot) & PAGE_LOCKS);
+        uint64_t seq = __atomic_fetch_add(&g_pagelock_seq, 1, __ATOMIC_RELAXED);
+        LOGF("[PAGELOCK_ACQUIRE] seq=%llu tid=%d sysdepth=%d page=%#"PRIx64" pslot=%p before=%#"PRIx64" after=%#"PRIx64,
+             (unsigned long long)seq, m->tid, m->sysdepth, page, pslot, entry, entry + PAGE_LOCK);
         if (RecordPageLock(m, page, pslot)) {
           entry += PAGE_LOCK;
         } else {
-          ReleasePageLock(pslot);
+          ReleasePageLock(m, page, pslot);
           m->segvcode = SEGV_MAPERR_LINUX;
           return 0;
         }

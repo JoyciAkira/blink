@@ -77,8 +77,18 @@ typedef struct {
 
 static SlabMeta g_meta[MAX_SLABS];
 static int      g_meta_count = 0;
+static int      g_partial = -1;         /* head of partial-slab free list (index into g_meta) */
 
-static int g_partial = -1;         /* head of partial-slab free list (index into g_meta) */
+static volatile int g_mman_lock = 0;
+static inline void mman_lock(void) {
+    while (__atomic_exchange_n(&g_mman_lock, 1, __ATOMIC_ACQUIRE)) {
+        __builtin_wasm_memory_atomic_wait32((int *)&g_mman_lock, 1, 1000000);
+    }
+}
+static inline void mman_unlock(void) {
+    __atomic_store_n(&g_mman_lock, 0, __ATOMIC_RELEASE);
+    __builtin_wasm_memory_atomic_notify((int *)&g_mman_lock, 1);
+}
 
 /* -------------------------------------------------------------------------
  * Big-block free list (for allocations > 64KB)
@@ -260,6 +270,7 @@ void *mmap(void *addr, size_t length, int prot, int flags, int fd, long offset) 
 
     if (length == 0) length = 1;
 
+    mman_lock();
     bw_shim_mmap_count++;
     bw_shim_requested_bytes += (unsigned long long)length;
     if ((unsigned long long)length > bw_shim_largest_request)
@@ -321,14 +332,15 @@ void *mmap(void *addr, size_t length, int prot, int flags, int fd, long offset) 
         }
     }
 
+    mman_unlock();
     return data;
 }
-
 /* -------------------------------------------------------------------------
  * munmap
  * ---------------------------------------------------------------------- */
 int munmap(void *addr, size_t length) {
-    if (!addr || addr == MAP_FAILED) return 0;
+    mman_lock();
+    if (!addr || addr == MAP_FAILED) { mman_unlock(); return 0; }
 
     uint8_t *ptr     = (uint8_t *)addr;
     uint8_t *slab_base = (uint8_t *)((uintptr_t)ptr & ~(uintptr_t)(WASM_PAGE - 1));
@@ -365,6 +377,7 @@ int munmap(void *addr, size_t length) {
         }
     }
 
+    mman_unlock();
     return 0;
 }
 

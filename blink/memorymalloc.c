@@ -718,6 +718,8 @@ static void RemoveVirtual(struct System *s, i64 virt, i64 size,
           if (pt & PAGE_LOCKS) {
             WaitForPageToNotBeLocked(s, virt, pp);
           } else if (CasPte(pp, pt, 0)) {
+            LOGF("[PAGE_MAPPING_MUTATION] op=RemoveVirtual page=%#"PRIx64" pslot=%p old_pte=%#"PRIx64" new_pte=0 (locks=%d)",
+                 virt, pp, pt, (int)(pt & PAGE_LOCKS));
             break;
           }
           pt = LoadPte(pp);
