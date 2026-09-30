@@ -39,7 +39,7 @@ static int CloseFd(struct Fd *fd) {
   if (fd->dirstream) {
     rc = VfsClosedir(fd->dirstream);
   } else {
-    rc = fd->cb->close(fd->fildes);
+    rc = fd->cb->close(GetHostFd(fd));
   }
   FreeFd(fd);
   return rc;
@@ -69,6 +69,10 @@ int SysClose(struct Machine *m, i32 fildes) {
   }
   UNLOCK(&m->system->fds.lock);
   if (!fd) return -1;
+  if (m->vfork_ctx) {
+    FreeFd(fd);
+    return 0;
+  }
   return FinishClose(m, CloseFd(fd));
 }
 
@@ -81,7 +85,11 @@ void SysCloseExec(struct System *s) {
     e2 = dll_next(s->fds.list, e);
     if (fd->oflags & O_CLOEXEC) {
       dll_remove(&s->fds.list, e);
-      dll_make_last(&fds, e);
+      if (s->is_vfork_borrowed) {
+        FreeFd(fd);
+      } else {
+        dll_make_last(&fds, e);
+      }
     }
   }
   UNLOCK(&s->fds.lock);

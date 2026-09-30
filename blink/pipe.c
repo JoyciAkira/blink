@@ -28,6 +28,7 @@
 #include "blink/endian.h"
 #include "blink/errno.h"
 #include "blink/fds.h"
+#include "blink/machine.h"
 #include "blink/log.h"
 #include "blink/ndelay.h"
 #include "blink/syscall.h"
@@ -77,6 +78,13 @@ int SysPipe2(struct Machine *m, i64 pipefds_addr, i32 flags) {
       unassert(AddFd(&m->system->fds, fds[0], O_RDONLY | oflags));
       unassert(AddFd(&m->system->fds, fds[1], O_WRONLY | oflags));
       UNLOCK(&m->system->fds.lock);
+      if (m->vfork_ctx && m->vfork_ctx->parent_machine) {
+        struct Machine *pm = m->vfork_ctx->parent_machine;
+        LOCK(&pm->system->fds.lock);
+        AddFd(&pm->system->fds, fds[0], O_RDONLY | oflags);
+        AddFd(&pm->system->fds, fds[1], O_WRONLY | oflags);
+        UNLOCK(&pm->system->fds.lock);
+      }
       Write32(fds_linux[0], fds[0]);
       Write32(fds_linux[1], fds[1]);
       unassert(!CopyToUserWrite(m, pipefds_addr, fds_linux, sizeof(fds_linux)));

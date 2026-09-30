@@ -190,3 +190,18 @@ void LogInit(const char *path) {
   WriteErrorInit();
   SetLogPath(path);
 }
+
+void VforkDiagLog(const char *fmt, ...) {
+  char buf[512];
+  va_list va;
+  va_start(va, fmt);
+  int n = vsnprintf(buf, sizeof(buf), fmt, va);
+  va_end(va);
+  if (n > 0) {
+    int fd = open("/tmp/vfork-diag.log", O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0666);
+    if (fd >= 0) {
+      (void)!write(fd, buf, n);
+      close(fd);
+    }
+  }
+}

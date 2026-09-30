@@ -29,6 +29,7 @@
 #include <netinet/in.h>
 #include <netinet/ip.h>
 #include <poll.h>
+#include <setjmp.h>
 #include <signal.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -335,6 +336,86 @@ static int SysFutexWake(struct Machine *m, i64 uaddr, u32 count) {
   return rc;
 }
 
+struct VforkChild {
+  int pid;
+  _Atomic(bool) active;
+  _Atomic(bool) exited;
+  _Atomic(bool) resumed;
+  _Atomic(int) exitcode;
+  _Atomic(int) termsig;
+  struct Machine *parent;
+  struct Machine *child_machine;
+  pthread_mutex_t lock;
+  pthread_cond_t cond;
+};
+
+#define MAX_VFORK_CHILDREN 32
+static struct VforkChild g_vfork_children[MAX_VFORK_CHILDREN];
+static pthread_mutex_t g_vfork_lock = PTHREAD_MUTEX_INITIALIZER;
+static int g_next_vfork_pid = 2000;
+bool g_parent_resumed_log = false;
+
+static void VforkNotifyExec(struct Machine *m) {
+  struct VforkChild *c = m ? m->vfork_child : NULL;
+  if (c) {
+    pthread_mutex_lock(&c->lock);
+    c->resumed = true;
+    pthread_cond_signal(&c->cond);
+    pthread_mutex_unlock(&c->lock);
+  }
+}
+
+bool VforkNotifyExit(struct Machine *m, int rc) {
+  struct VforkChild *c = m ? m->vfork_child : NULL;
+  VforkDiagLog("[C0_DIAG] VforkNotifyExit rc=%d tid=%d pid=%d ip=%#"PRIx64" child=%p vfork_ctx=%p\n",
+               rc, m ? m->tid : 0, (m && m->system) ? m->system->pid : 0, m ? m->ip : 0, c, m ? m->vfork_ctx : NULL);
+  if (c) {
+    if (m && m->system && m != c->parent && !m->vfork_ctx) {
+      LOCK(&m->system->fds.lock);
+      struct Dll *e, *e2;
+      for (e = dll_first(m->system->fds.list); e; e = e2) {
+        e2 = dll_next(m->system->fds.list, e);
+        struct Fd *fd = FD_CONTAINER(e);
+        dll_remove(&m->system->fds.list, e);
+        if (fd->hostfd >= 0) {
+          VforkDiagLog("[C1_DIAG] closing child fd=%d hostfd=%d\n", fd->fildes, fd->hostfd);
+          close(fd->hostfd);
+        }
+        FreeFd(fd);
+      }
+      UNLOCK(&m->system->fds.lock);
+    }
+    pthread_mutex_lock(&c->lock);
+    c->exited = true;
+    c->exitcode = rc;
+    c->resumed = true;
+    pthread_cond_signal(&c->cond);
+    pthread_mutex_unlock(&c->lock);
+    if (c->parent) {
+      EnqueueSignal(c->parent, SIGCHLD_LINUX);
+      if (c->parent->thread) {
+        pthread_kill(c->parent->thread, SIGCHLD);
+      }
+    }
+    if (m->vfork_ctx) {
+      struct VforkContext *vctx = m->vfork_ctx;
+      m->vfork_ctx = NULL;
+#ifdef __wasm__
+      longjmp(vctx->parent_env, 1);
+#else
+      siglongjmp(vctx->parent_env, 1);
+#endif
+    }
+    return true;
+  }
+  return false;
+}
+void VforkUpdateChildMachine(struct Machine *m) {
+  if (m && m->vfork_child) {
+    m->vfork_child->child_machine = m;
+  }
+}
+
 static void ClearChildTid(struct Machine *m) {
 #if defined(HAVE_FORK) || defined(HAVE_THREADS)
   _Atomic(int) *ctid;
@@ -352,6 +433,9 @@ static void ClearChildTid(struct Machine *m) {
 
 _Noreturn void SysExitGroup(struct Machine *m, int rc) {
   THR_LOGF("pid=%d tid=%d SysExitGroup", m->system->pid, m->tid);
+  if (VforkNotifyExit(m, rc)) {
+    pthread_exit(NULL);
+  }
   ClearChildTid(m);
   if (m->system->isfork) {
 #ifndef NDEBUG
@@ -395,6 +479,9 @@ _Noreturn void SysExitGroup(struct Machine *m, int rc) {
 _Noreturn void SysExit(struct Machine *m, int rc) {
 #ifdef HAVE_THREADS
   THR_LOGF("pid=%d tid=%d SysExit", m->system->pid, m->tid);
+  if (VforkNotifyExit(m, rc)) {
+    pthread_exit(NULL);
+  }
   if (IsOrphan(m)) {
     SysExitGroup(m, rc);
   } else {
@@ -483,13 +570,22 @@ static int Fork(struct Machine *m, u64 flags, u64 stack, u64 ctid) {
   return pid;
 }
 
+static int SysVforkSpawn(struct Machine *m, u64 flags, u64 stack, u64 ptid, u64 ctid, u64 tls);
+
 static int SysFork(struct Machine *m) {
+#ifdef HAVE_FORK
   return Fork(m, 0, 0, 0);
+#else
+  return SysVforkSpawn(m, SIGCHLD_LINUX, 0, 0, 0, 0);
+#endif
 }
 
 static int SysVfork(struct Machine *m) {
-  // TODO: Parent should be stopped while child is running.
+#ifdef HAVE_FORK
   return SysFork(m);
+#else
+  return SysVforkSpawn(m, CLONE_VM_LINUX | CLONE_VFORK_LINUX | SIGCHLD_LINUX, 0, 0, 0, 0);
+#endif
 }
 
 static void *OnSpawn(void *arg) {
@@ -497,6 +593,7 @@ static void *OnSpawn(void *arg) {
   struct Machine *m = (struct Machine *)arg;
   THR_LOGF("pid=%d tid=%d OnSpawn", m->system->pid, m->tid);
   m->thread = pthread_self();
+  g_machine = m;
   if (!(rc = sigsetjmp(m->onhalt, 1))) {
     m->canhalt = true;
     unassert(!pthread_sigmask(SIG_SETMASK, &m->spawn_sigmask, 0));
@@ -591,6 +688,230 @@ static int SysSpawn(struct Machine *m, u64 flags, u64 stack, u64 ptid, u64 ctid,
   return tid;
 }
 #endif
+static int SysVforkSpawn(struct Machine *m, u64 flags, u64 stack, u64 ptid, u64 ctid, u64 tls) {
+  int err, i;
+  struct Machine *m2 = NULL;
+  struct System *s2 = NULL;
+  struct VforkChild *child = NULL;
+  sigset_t ss, oldss;
+  pthread_attr_t attr;
+  pthread_t thread;
+  _Atomic(int) *ptid_ptr = NULL;
+  _Atomic(int) *ctid_ptr = NULL;
+  struct Dll *e;
+
+  if ((flags & CLONE_PARENT_SETTID_LINUX) &&
+      (!(ptid_ptr = (_Atomic(int) *)LookupAddress(m, ptid)))) {
+    return efault();
+  }
+  if ((flags & CLONE_CHILD_SETTID_LINUX) &&
+      (!(ctid_ptr = (_Atomic(int) *)LookupAddress(m, ctid)))) {
+    return efault();
+  }
+
+  pthread_mutex_lock(&g_vfork_lock);
+  for (i = 0; i < MAX_VFORK_CHILDREN; i++) {
+    if (!g_vfork_children[i].active) {
+      child = &g_vfork_children[i];
+      break;
+    }
+  }
+  if (!child) {
+    pthread_mutex_unlock(&g_vfork_lock);
+    return eagain();
+  }
+  memset(child, 0, sizeof(*child));
+  child->pid = g_next_vfork_pid++;
+  child->active = true;
+  child->parent = m;
+  pthread_mutex_init(&child->lock, NULL);
+  pthread_cond_init(&child->cond, NULL);
+  pthread_mutex_unlock(&g_vfork_lock);
+
+  // Allocate child System with independent FDs and shared address space
+  s2 = NewSystem(m->system->mode);
+  if (!s2) {
+    pthread_mutex_lock(&g_vfork_lock);
+    child->active = false;
+    pthread_mutex_unlock(&g_vfork_lock);
+    return enomem();
+  }
+  s2->is_vfork_borrowed = true;
+  s2->real = m->system->real;
+  s2->cr3 = m->system->cr3;
+  s2->pid = child->pid;
+  s2->exec = m->system->exec;
+
+  // Invariant #4: Clone parent file descriptors to isolate child dup2/close
+  LOCK(&m->system->fds.lock);
+  for (e = dll_first(m->system->fds.list); e; e = dll_next(m->system->fds.list, e)) {
+    struct Fd *f = FD_CONTAINER(e);
+    ForkFd(&s2->fds, f, f->fildes, f->oflags);
+  }
+  UNLOCK(&m->system->fds.lock);
+
+  // Allocate child Machine
+  m2 = NewMachine(s2, NULL);
+  if (!m2) {
+    FreeSystem(s2);
+    pthread_mutex_lock(&g_vfork_lock);
+    child->active = false;
+    pthread_mutex_unlock(&g_vfork_lock);
+    return enomem();
+  }
+  memcpy(m2->beg, m->beg, sizeof(m2->beg));
+  memcpy(m2->xmm, m->xmm, sizeof(m2->xmm));
+  memcpy(&m2->fpu, &m->fpu, sizeof(m2->fpu));
+  m2->flags = m->flags;
+  m2->ip = m->ip;
+  m2->fs = m->fs;
+  m2->gs = m->gs;
+  m2->tid = child->pid;
+  m2->vfork_child = child;
+  child->child_machine = m2;
+
+  Put64(m2->ax, 0); // child returns 0 from clone
+  Put64(m2->sp, stack ? stack : Get64(m->sp));
+  if (flags & CLONE_SETTLS_LINUX) {
+    m2->fs.base = tls;
+  }
+  if (flags & CLONE_CHILD_CLEARTID_LINUX) {
+    m2->ctid = ctid;
+  }
+  if (flags & CLONE_CHILD_SETTID_LINUX && ctid_ptr) {
+    atomic_store_explicit(ctid_ptr, Little32(child->pid), memory_order_release);
+  }
+  if (flags & CLONE_PARENT_SETTID_LINUX && ptid_ptr) {
+    atomic_store_explicit(ptid_ptr, Little32(child->pid), memory_order_release);
+  }
+  struct VforkContext ctx;
+  memset(&ctx, 0, sizeof(ctx));
+  ctx.child_pid = child->pid;
+  ctx.parent_machine = m;
+  m2->vfork_ctx = &ctx;
+  // CLONE_VM_DATA_RESTORE_GUARD: Save parent registers and state in static storage
+  static struct DescriptorCache saved_fs;
+  static struct DescriptorCache saved_gs;
+  static u64 saved_sp;
+  static u8 saved_beg[128];
+  static u8 saved_pthread[512];
+  static bool have_pthread;
+  static u8 saved_musl[16384];
+  static bool have_musl;
+  static u8 saved_stack[512];
+  static bool have_stack;
+  static int saved_stdin;
+  static int saved_stdout;
+  static int saved_stderr;
+  static u64 saved_node_environ;
+  static bool have_node_environ;
+  static u64 saved_musl_environ;
+  static bool have_musl_environ;
+  static u64 saved_node_signal_pipefd;
+  static bool have_node_signal_pipefd;
+
+  saved_fs = m->fs;
+  saved_gs = m->gs;
+  saved_sp = Get64(m->sp);
+  memcpy(saved_beg, m->beg, sizeof(saved_beg));
+
+  have_pthread = false;
+  if (saved_fs.base) {
+    have_pthread = (CopyFromUserRead(m, saved_pthread, saved_fs.base, sizeof(saved_pthread)) != -1);
+  }
+
+  have_musl = (CopyFromUserRead(m, saved_musl, 0x87294000, sizeof(saved_musl)) != -1);
+  have_stack = (CopyFromUserRead(m, saved_stack, saved_sp, sizeof(saved_stack)) != -1);
+  have_node_environ = (CopyFromUserRead(m, &saved_node_environ, 0x8d37aee0, sizeof(saved_node_environ)) != -1);
+  have_musl_environ = (CopyFromUserRead(m, &saved_musl_environ, 0x87296de0, sizeof(saved_musl_environ)) != -1);
+  have_node_signal_pipefd = (CopyFromUserRead(m, &saved_node_signal_pipefd, 0x8d36fcc0, sizeof(saved_node_signal_pipefd)) != -1);
+  VforkDiagLog("[VFORK_ENV_SAVE] node_env=%#"PRIx64" (ok=%d) musl_env=%#"PRIx64" (ok=%d) sigpipefd=%#"PRIx64" (ok=%d)\n",
+               saved_node_environ, have_node_environ, saved_musl_environ, have_musl_environ,
+               saved_node_signal_pipefd, have_node_signal_pipefd);
+  saved_stdin = dup(0);
+  saved_stdout = dup(1);
+  saved_stderr = dup(2);
+
+#define RESTORE_PARENT_GUARD() do { \
+    memcpy(m->beg, saved_beg, sizeof(saved_beg)); \
+    Put64(m->ax, child->pid); \
+    m->fs = saved_fs; \
+    m->gs = saved_gs; \
+    Put64(m->sp, saved_sp); \
+    if (have_pthread && m->fs.base) { \
+      CopyToUserWrite(m, m->fs.base, saved_pthread, sizeof(saved_pthread)); \
+    } \
+    if (have_musl) { \
+      int musl_rc = CopyToUserWrite(m, 0x87294000, saved_musl, sizeof(saved_musl)); \
+      VforkDiagLog("[VFORK_DATA_RESTORE_GUARD] CopyToUserWrite musl rc=%d\n", musl_rc); \
+    } \
+    LOCK(&m->system->machines_lock); \
+    for (struct Dll *e_m = dll_first(m->system->machines); e_m; e_m = dll_next(m->system->machines, e_m)) { \
+      struct Machine *tm = MACHINE_CONTAINER(e_m); \
+      if (tm && tm->fs.base) { \
+        u32 orig_tid = Little32(tm->tid); \
+        CopyToUserWrite(tm, tm->fs.base + 0x30, &orig_tid, 4); \
+      } \
+    } \
+    UNLOCK(&m->system->machines_lock); \
+    if (have_stack) { \
+      CopyToUserWrite(m, saved_sp, saved_stack, sizeof(saved_stack)); \
+    } \
+    if (have_node_environ) { \
+      CopyToUserWrite(m, 0x8d37aee0, &saved_node_environ, sizeof(saved_node_environ)); \
+      VforkDiagLog("[VFORK_ENV_RESTORE] restored node_env=%#"PRIx64"\n", saved_node_environ); \
+    } \
+    if (have_node_signal_pipefd) { \
+      CopyToUserWrite(m, 0x8d36fcc0, &saved_node_signal_pipefd, sizeof(saved_node_signal_pipefd)); \
+      VforkDiagLog("[VFORK_PIPEFD_RESTORE] restored node_signal_pipefd=%#"PRIx64"\n", saved_node_signal_pipefd); \
+    } \
+    if (have_musl_environ) { \
+      CopyToUserWrite(m, 0x87296de0, &saved_musl_environ, sizeof(saved_musl_environ)); \
+      VforkDiagLog("[VFORK_ENV_RESTORE] restored musl_env=%#"PRIx64"\n", saved_musl_environ); \
+    } \
+    if (saved_stdin >= 0) { dup2(saved_stdin, 0); close(saved_stdin); saved_stdin = -1; } \
+    if (saved_stdout >= 0) { dup2(saved_stdout, 1); close(saved_stdout); saved_stdout = -1; } \
+    if (saved_stderr >= 0) { dup2(saved_stderr, 2); close(saved_stderr); saved_stderr = -1; } \
+    sigset_t unblock_ss; sigemptyset(&unblock_ss); pthread_sigmask(SIG_SETMASK, &unblock_ss, 0); \
+    LOCK(&s2->fds.lock); \
+    LOCK(&m->system->fds.lock); \
+    for (struct Dll *e_prop = dll_first(s2->fds.list); e_prop; e_prop = dll_next(s2->fds.list, e_prop)) { \
+      struct Fd *f_prop = FD_CONTAINER(e_prop); \
+      if (!GetFd(&m->system->fds, f_prop->fildes)) { \
+        ForkFd(&m->system->fds, f_prop, f_prop->fildes, f_prop->oflags); \
+        VforkDiagLog("[VFORK_FD_PROPAGATED] fd=%d propagated to parent\n", f_prop->fildes); \
+      } \
+    } \
+    UNLOCK(&m->system->fds.lock); \
+    UNLOCK(&s2->fds.lock); \
+    VforkDiagLog("[VFORK_DATA_RESTORE_GUARD] Restored registers, transactional memory undo, and stdio FDs!\n"); \
+  } while (0)
+
+  VforkDiagLog("[C0_DIAG] SysVforkSpawn starting child_pid=%d ip=%#"PRIx64" sp=%#"PRIx64"\n",
+               child->pid, m2->ip, Get64(m2->sp));
+
+#ifdef __wasm__
+  if (setjmp(ctx.parent_env)) {
+#else
+  if (sigsetjmp(ctx.parent_env, 1)) {
+#endif
+    g_parent_resumed_log = true;
+    VforkDiagLog("[C0_DIAG] parent resumed from setjmp child_pid=%d\n", child->pid);
+    RESTORE_PARENT_GUARD();
+    return child->pid;
+  }
+
+  VforkDiagLog("[C0_DIAG] parent entering Blink(m2)\n");
+  struct Machine *old_g = g_machine;
+  g_machine = m2;
+  m2->canhalt = true;
+  Blink(m2);
+  g_machine = old_g;
+  g_parent_resumed_log = true;
+  VforkDiagLog("[C0_DIAG] Blink(m2) returned! child_pid=%d\n", child->pid);
+  RESTORE_PARENT_GUARD();
+  return child->pid;
+}
 
 static bool IsForkOrVfork(u64 flags) {
   u64 supported = CLONE_CHILD_SETTID_LINUX | CLONE_CHILD_CLEARTID_LINUX;
@@ -605,8 +926,7 @@ static int SysClone(struct Machine *m, u64 flags, u64 stack, u64 ptid, u64 ctid,
 #ifdef HAVE_FORK
     return Fork(m, flags, stack, ctid);
 #else
-    LOGF("forking support disabled");
-    return enosys();
+    return SysVforkSpawn(m, flags, stack, ptid, ctid, tls);
 #endif
   }
 #ifdef HAVE_THREADS
@@ -1416,6 +1736,35 @@ static int SysDup2(struct Machine *m, i32 fildes, i32 newfildes) {
     UNLOCK(&m->system->fds.lock);
   } else if (newfildes >= GetFileDescriptorLimit(m->system)) {
     return ebadf();
+  } else if (m->vfork_ctx || m->system->is_vfork_borrowed) {
+    LOCK(&m->system->fds.lock);
+    if (!(fd = GetFd(&m->system->fds, fildes))) {
+      UNLOCK(&m->system->fds.lock);
+      return ebadf();
+    }
+    int src_hostfd = GetHostFd(fd);
+    int new_hostfd = dup(src_hostfd);
+    if (new_hostfd == -1) {
+      UNLOCK(&m->system->fds.lock);
+      return -1;
+    }
+    struct Fd *old_fd = GetFd(&m->system->fds, newfildes);
+    if (old_fd) {
+      dll_remove(&m->system->fds.list, &old_fd->elem);
+      if (old_fd->hostfd >= 0 && old_fd->hostfd != old_fd->fildes) {
+        close(old_fd->hostfd);
+      }
+      FreeFd(old_fd);
+    }
+    oflags = fd->oflags & ~O_CLOEXEC;
+    struct Fd *new_fd = ForkFd(&m->system->fds, fd, newfildes, oflags);
+    if (new_fd) {
+      new_fd->hostfd = new_hostfd;
+    }
+    UNLOCK(&m->system->fds.lock);
+    VforkDiagLog("[VFORK_DUP2] virtualized guest_fd %d -> host_fd %d (src_guest=%d src_host=%d)\n",
+                 newfildes, new_hostfd, fildes, src_hostfd);
+    return newfildes;
   } else if ((rc = Dup2(m, fildes, newfildes)) != -1) {
     LOCK(&m->system->fds.lock);
     if ((fd = GetFd(&m->system->fds, newfildes))) {
@@ -1438,6 +1787,42 @@ static int SysDup3(struct Machine *m, i32 fildes, i32 newfildes, i32 flags) {
   if (fildes == newfildes) return einval();
   if (flags & ~O_CLOEXEC_LINUX) return einval();
   if (newfildes >= GetFileDescriptorLimit(m->system)) return ebadf();
+  if (m->vfork_ctx || m->system->is_vfork_borrowed) {
+    LOCK(&m->system->fds.lock);
+    if (!(fd = GetFd(&m->system->fds, fildes))) {
+      UNLOCK(&m->system->fds.lock);
+      return ebadf();
+    }
+    int src_hostfd = GetHostFd(fd);
+    int new_hostfd = dup(src_hostfd);
+    if (new_hostfd == -1) {
+      UNLOCK(&m->system->fds.lock);
+      return -1;
+    }
+    if (flags & O_CLOEXEC_LINUX) {
+      (void)!VfsFcntl(new_hostfd, F_SETFD, FD_CLOEXEC);
+    }
+    struct Fd *old_fd = GetFd(&m->system->fds, newfildes);
+    if (old_fd) {
+      dll_remove(&m->system->fds.list, &old_fd->elem);
+      if (old_fd->hostfd >= 0 && old_fd->hostfd != old_fd->fildes) {
+        close(old_fd->hostfd);
+      }
+      FreeFd(old_fd);
+    }
+    oflags = fd->oflags & ~O_CLOEXEC;
+    if (flags & O_CLOEXEC_LINUX) {
+      oflags |= O_CLOEXEC;
+    }
+    struct Fd *new_fd = ForkFd(&m->system->fds, fd, newfildes, oflags);
+    if (new_fd) {
+      new_fd->hostfd = new_hostfd;
+    }
+    UNLOCK(&m->system->fds.lock);
+    VforkDiagLog("[VFORK_DUP3] virtualized guest_fd %d -> host_fd %d (src_guest=%d src_host=%d)\n",
+                 newfildes, new_hostfd, fildes, src_hostfd);
+    return newfildes;
+  }
 #ifdef HAVE_DUP3
   if ((rc = Dup3(m, fildes, newfildes, XlatOpenFlags(flags))) != -1) {
 #else
@@ -2415,7 +2800,7 @@ static i64 SysRead(struct Machine *m, i32 fildes, i64 addr, u64 size) {
   if (size) {
     InitIovs(&iv);
     if ((rc = AppendIovsReal(m, &iv, addr, size, PROT_WRITE)) != -1) {
-      RESTARTABLE(rc = readv_impl(fildes, iv.p, iv.i));
+      RESTARTABLE(rc = readv_impl(GetHostFd(fd), iv.p, iv.i));
       if (rc != -1) SetWriteAddr(m, addr, rc);
     }
     FreeIovs(&iv);
@@ -2447,7 +2832,7 @@ static i64 SysWrite(struct Machine *m, i32 fildes, i64 addr, u64 size) {
   if (size) {
     InitIovs(&iv);
     if ((rc = AppendIovsReal(m, &iv, addr, size, PROT_READ)) != -1) {
-      RESTARTABLE(rc = writev_impl(fildes, iv.p, iv.i));
+      RESTARTABLE(rc = writev_impl(GetHostFd(fd), iv.p, iv.i));
       if (rc != -1) SetReadAddr(m, addr, rc);
     }
     FreeIovs(&iv);
@@ -2546,13 +2931,13 @@ static i64 SysPreadv2(struct Machine *m, i32 fildes, i64 iovaddr, u32 iovlen,
     if ((rc = AppendIovsGuest(m, &iv, iovaddr, iovlen, PROT_WRITE)) != -1) {
       if (iv.i) {
         if (offset == -1) {
-          RESTARTABLE(rc = readv_impl(fildes, iv.p, iv.i));
+          RESTARTABLE(rc = readv_impl(GetHostFd(fd), iv.p, iv.i));
         } else if (offset < 0) {
           return einval();
         } else if (offset > NUMERIC_MAX(off_t)) {
           return eoverflow();
         } else {
-          RESTARTABLE(rc = VfsPreadv(fildes, iv.p, iv.i, offset));
+          RESTARTABLE(rc = VfsPreadv(GetHostFd(fd), iv.p, iv.i, offset));
         }
       } else {
         rc = 0;
@@ -2594,14 +2979,14 @@ static i64 SysPwritev2(struct Machine *m, i32 fildes, i64 iovaddr, u32 iovlen,
     if ((rc = AppendIovsGuest(m, &iv, iovaddr, iovlen, PROT_READ)) != -1) {
       if (iv.i) {
         if (offset == -1) {
-          RESTARTABLE(rc = writev_impl(fildes, iv.p, iv.i));
+          RESTARTABLE(rc = writev_impl(GetHostFd(fd), iv.p, iv.i));
           rc = HandleSigpipe(m, rc, 0);
         } else if (offset < 0) {
           return einval();
         } else if (offset > NUMERIC_MAX(off_t)) {
           return eoverflow();
         } else {
-          RESTARTABLE(rc = VfsPwritev(fildes, iv.p, iv.i, offset));
+          RESTARTABLE(rc = VfsPwritev(GetHostFd(fd), iv.p, iv.i, offset));
         }
       } else {
         rc = 0;
@@ -3593,16 +3978,63 @@ static void ExecveBlink(struct Machine *m, char *prog, char **argv,
     execfn = prog;
     sigfillset(&block);
     unassert(!pthread_sigmask(SIG_BLOCK, &block, &m->system->exec_sigmask));
-    if (CanEmulateExecutable(m, &prog, &argv)) {
-      // point of no return
+    bool emu = CanEmulateExecutable(m, &prog, &argv);
+    VforkDiagLog("[C0_DIAG] ExecveBlink prog=%s can_emulate=%d vfork_ctx=%p\n", prog, emu, m->vfork_ctx);
+    if (emu) {
       // prog/argv/envp are copied onto the freelist
       m->sysdepth = 0;
       CollectPageLocks(m);
       // TODO(jart): Prevent possibility of stack overflow.
       SYS_LOGF("m->system->exec(%s)", prog);
-      SysCloseExec(m->system);
+      if (!m->vfork_ctx) SysCloseExec(m->system);
       ResetTimerDispositions(m->system);
       ResetSignalDispositions(m->system);
+      if (m->vfork_ctx) {
+        VforkDiagLog("[C0_DIAG] ExecveBlink inside vfork_ctx before LoadProgram\n");
+        struct VforkContext *vctx = m->vfork_ctx;
+        m->vfork_ctx = NULL;
+        struct Machine *m_new = NewMachine(NewSystem(XED_MACHINE_MODE_LONG), 0);
+        g_machine = m_new;
+        m_new->system->exec = m->system->exec;
+        m_new->system->pid = (m->vfork_child ? m->vfork_child->pid : 2000);
+        m_new->vfork_child = m->vfork_child;
+        if (m->vfork_child) {
+          m->vfork_child->child_machine = m_new;
+        }
+        LOCK(&m->system->fds.lock);
+        for (struct Dll *e_fd = dll_first(m->system->fds.list); e_fd; e_fd = dll_next(m->system->fds.list, e_fd)) {
+          struct Fd *f_fd = FD_CONTAINER(e_fd);
+          struct Fd *nf = ForkFd(&m_new->system->fds, f_fd, f_fd->fildes, f_fd->oflags);
+          if (nf) {
+            nf->hostfd = f_fd->hostfd;
+          }
+        }
+        UNLOCK(&m->system->fds.lock);
+        VforkDiagLog("[C0_DIAG] ExecveBlink calling LoadProgram on %s\n", execfn);
+        LoadProgram(m_new, execfn, prog, argv, envp, NULL);
+        VforkDiagLog("[C0_DIAG] ExecveBlink LoadProgram completed ip=%#"PRIx64"\n", m_new->ip);
+
+        pthread_t thread;
+        pthread_attr_t attr;
+        pthread_attr_init(&attr);
+        pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+        pthread_create(&thread, &attr, OnSpawn, m_new);
+        pthread_attr_destroy(&attr);
+        VforkDiagLog("[C0_DIAG] ExecveBlink pthread_create completed, calling longjmp!\n");
+
+        pthread_sigmask(SIG_SETMASK, &m->system->exec_sigmask, 0);
+        g_machine = vctx->parent_machine;
+#ifdef __wasm__
+        longjmp(vctx->parent_env, 1);
+#else
+        siglongjmp(vctx->parent_env, 1);
+#endif
+      }
+      if (m->vfork_child) {
+        int rc = m->system->exec(execfn, prog, argv, envp);
+        VforkNotifyExit(m, rc);
+        pthread_exit(NULL);
+      }
       _Exit(m->system->exec(execfn, prog, argv, envp));
     }
     unassert(!pthread_sigmask(SIG_SETMASK, &m->system->exec_sigmask, 0));
@@ -3614,12 +4046,92 @@ static int SysExecve(struct Machine *m, i64 pa, i64 aa, i64 ea) {
   if (!(prog = CopyStr(m, pa))) return -1;
   if (!(argv = CopyStrList(m, aa))) return -1;
   if (!(envp = CopyStrList(m, ea))) return -1;
+  VforkDiagLog("[C0_DIAG] SysExecve called prog=%s is_vfork=%d\n", prog, !!m->vfork_ctx);
   LOCK(&m->system->exec_lock);
   ExecveBlink(m, prog, argv, envp);
   SYS_LOGF("execve(%s)", prog);
+  VforkDiagLog("[C0_DIAG] ExecveBlink returned, falling to VfsExecve prog=%s\n", prog);
   VfsExecve(prog, argv, envp);
   UNLOCK(&m->system->exec_lock);
   return -1;
+}
+static bool VforkWait4(struct Machine *m, int pid, i64 opt_out_wstatus_addr,
+                       int options, int *out_rc) {
+  int i;
+  struct VforkChild *c = NULL;
+  pthread_mutex_lock(&g_vfork_lock);
+  for (i = 0; i < MAX_VFORK_CHILDREN; i++) {
+    if (g_vfork_children[i].active && (pid == -1 || g_vfork_children[i].pid == pid)) {
+      if (g_vfork_children[i].exited) {
+        c = &g_vfork_children[i];
+        break;
+      }
+    }
+  }
+  if (c) {
+    int child_pid = c->pid;
+    int exitcode = c->exitcode;
+    int termsig = c->termsig;
+    i32 gwstatus;
+    if (termsig > 0) {
+      gwstatus = termsig & 0x7f;
+      VforkDiagLog("[VFORK_WAIT4] child_pid=%d terminated by signal %d gwstatus=%#x\n",
+                   child_pid, termsig, gwstatus);
+    } else {
+      gwstatus = (exitcode & 0xff) << 8;
+      VforkDiagLog("[VFORK_WAIT4] child_pid=%d normal exit code %d gwstatus=%#x\n",
+                   child_pid, exitcode, gwstatus);
+    }
+    u8 gwstatusb[4];
+    Write32(gwstatusb, gwstatus);
+    if (opt_out_wstatus_addr) {
+      CopyToUserWrite(m, opt_out_wstatus_addr, gwstatusb, sizeof(gwstatusb));
+    }
+    c->active = false;
+    pthread_mutex_unlock(&g_vfork_lock);
+    *out_rc = child_pid;
+    return true;
+  }
+  for (i = 0; i < MAX_VFORK_CHILDREN; i++) {
+    if (g_vfork_children[i].active && (pid == -1 || g_vfork_children[i].pid == pid)) {
+      c = &g_vfork_children[i];
+      break;
+    }
+  }
+  if (c) {
+    if (options & WNOHANG) {
+      pthread_mutex_unlock(&g_vfork_lock);
+      *out_rc = 0;
+      return true;
+    }
+    while (c->active && !c->exited) {
+      pthread_cond_wait(&c->cond, &g_vfork_lock);
+    }
+    int child_pid = c->pid;
+    int exitcode = c->exitcode;
+    int termsig = c->termsig;
+    i32 gwstatus;
+    if (termsig > 0) {
+      gwstatus = termsig & 0x7f;
+      VforkDiagLog("[VFORK_WAIT4] child_pid=%d terminated by signal %d gwstatus=%#x\n",
+                   child_pid, termsig, gwstatus);
+    } else {
+      gwstatus = (exitcode & 0xff) << 8;
+      VforkDiagLog("[VFORK_WAIT4] child_pid=%d normal exit code %d gwstatus=%#x\n",
+                   child_pid, exitcode, gwstatus);
+    }
+    u8 gwstatusb[4];
+    Write32(gwstatusb, gwstatus);
+    if (opt_out_wstatus_addr) {
+      CopyToUserWrite(m, opt_out_wstatus_addr, gwstatusb, sizeof(gwstatusb));
+    }
+    c->active = false;
+    pthread_mutex_unlock(&g_vfork_lock);
+    *out_rc = child_pid;
+    return true;
+  }
+  pthread_mutex_unlock(&g_vfork_lock);
+  return false;
 }
 
 static int SysWait4(struct Machine *m, int pid, i64 opt_out_wstatus_addr,
@@ -3636,6 +4148,10 @@ static int SysWait4(struct Machine *m, int pid, i64 opt_out_wstatus_addr,
       (opt_out_rusage_addr &&
        !IsValidMemory(m, opt_out_rusage_addr, sizeof(grusage), PROT_WRITE))) {
     return -1;
+  }
+  int vrc;
+  if (VforkWait4(m, pid, opt_out_wstatus_addr, options, &vrc)) {
+    return vrc;
   }
 #ifdef HAVE_WAIT4
   RESTARTABLE(rc = wait4(pid, &wstatus, options, &hrusage));
@@ -4922,6 +5438,38 @@ static int SysSigpending(struct Machine *m, i64 setaddr) {
 }
 
 static int SysKill(struct Machine *m, int pid, int sig) {
+  int i;
+  pthread_mutex_lock(&g_vfork_lock);
+  for (i = 0; i < MAX_VFORK_CHILDREN; i++) {
+    if (g_vfork_children[i].active && g_vfork_children[i].pid == pid) {
+      if (sig) {
+        g_vfork_children[i].termsig = sig;
+        if (g_vfork_children[i].child_machine) {
+          EnqueueSignal(g_vfork_children[i].child_machine, sig);
+          if (g_vfork_children[i].child_machine->thread) {
+            pthread_kill(g_vfork_children[i].child_machine->thread, SIGSYS);
+          }
+        }
+      }
+      pthread_mutex_unlock(&g_vfork_lock);
+      VforkDiagLog("[VFORK_KILL] delivered signal %d to virtual child %d\n", sig, pid);
+      return 0;
+    }
+  }
+  pthread_mutex_unlock(&g_vfork_lock);
+  if (pid >= 2000) {
+    VforkDiagLog("[VFORK_KILL] unknown or reaped virtual child %d -> ESRCH\n", pid);
+    return esrch();
+  }
+  if (m && m->vfork_child && m->vfork_child->parent &&
+      (pid == m->system->pid || pid == getppid()) && sig) {
+    EnqueueSignal(m->vfork_child->parent, sig);
+    if (m->vfork_child->parent->thread) {
+      pthread_kill(m->vfork_child->parent->thread, SIGSYS);
+    }
+    VforkDiagLog("[VFORK_KILL] delivered signal %d from virtual child to parent\n", sig);
+    return 0;
+  }
   return kill(pid, sig ? XlatSignal(sig) : 0);
 }
 
@@ -5467,16 +6015,27 @@ static i32 EpollPwait(struct Machine *m, i32 epfd, i64 eventsaddr,
 #if defined(HAVE_EPOLL_PWAIT2) && !defined(MUSL_CROSS_MAKE)
       rc = epoll_pwait2(epfd, events, maxevents, &waitfor, &oldmask);
 #else
-      rc = epoll_pwait(epfd, events, maxevents,
-                       ConvertTimeToInt(ToMilliseconds(waitfor)), &oldmask);
-#endif
+      int slice_ms = ConvertTimeToInt(ToMilliseconds(waitfor));
+      if (slice_ms < 0 || slice_ms > 20) {
+        slice_ms = 20;
+      }
+      rc = epoll_pwait(epfd, events, maxevents, slice_ms, &oldmask);
       if (rc == -1 && errno == EINTR) {
         if (CheckInterrupt(m, false)) {
+          break;
+        }
+      } else if (rc == 0) {
+        if (CheckInterrupt(m, false)) {
+          rc = -1;
+          break;
+        }
+        if (CompareTime(GetTime(), deadline) >= 0) {
           break;
         }
       } else {
         break;
       }
+#endif
     } while (1);
   } else {
     rc = -1;
@@ -5709,12 +6268,8 @@ void OpSyscall(P) {
     SYSCALL(5, 0x036, "setsockopt", SysSetsockopt, STRACE_5);
     SYSCALL(5, 0x037, "getsockopt", SysGetsockopt, STRACE_5);
 #endif /* DISABLE_SOCKETS */
-#ifdef HAVE_FORK
     SYSCALL(0, 0x039, "fork", SysFork, STRACE_FORK);
-#ifndef DISABLE_NONPOSIX
     SYSCALL(0, 0x03A, "vfork", SysVfork, STRACE_VFORK);
-#endif
-#endif /* HAVE_FORK */
     SYSCALL(4, 0x03D, "wait4", SysWait4, STRACE_WAIT4);
     SYSCALL(2, 0x03E, "kill", SysKill, STRACE_KILL);
 #ifdef HAVE_THREADS

@@ -85,7 +85,7 @@ restart:
 			continue;
 		}
 
-		char *z = strchrnul(stack+p, '/');
+		char *z = strchrnul_(stack+p, '/');
 		l0 = l = z-(stack+p);
 
 		if (!l && !check_dir) break;

@@ -261,11 +261,22 @@ struct OpCache {
   _Atomic(bool) invalidated;
   u64 icache[512][kInstructionBytes / 8];
 };
+struct VforkChild;
+struct VforkContext {
+#ifdef __wasm__
+  jmp_buf parent_env;
+#else
+  sigjmp_buf parent_env;
+#endif
+  int child_pid;
+  struct Machine *parent_machine;
+};
 
 struct System {
   struct XedMachineMode mode;
   bool dlab;
   bool isfork;
+  bool is_vfork_borrowed;
   bool exited;
   bool loaded;
   bool iscosmo;
@@ -446,6 +457,8 @@ struct Machine {               //
   i64 robust_list;                       //
   i64 ctid;                              //
   int tid;                               //
+  struct VforkChild *vfork_child;        //
+  struct VforkContext *vfork_ctx;        //
   sigset_t spawn_sigmask;                //
   struct Dll elem;                       //
   struct SmcQueue smcqueue;              //

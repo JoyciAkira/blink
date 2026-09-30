@@ -125,5 +125,6 @@ void LogInfo(const char *, int, const char *, ...) printf_attr(3);
 int WriteError(int, const char *, int);
 void WriteErrorInit(void);
 int WriteErrorString(const char *);
+void VforkDiagLog(const char *, ...) printf_attr(1);
 
 #endif /* BLINK_LOG_H_ */

@@ -30,6 +30,7 @@ struct FdCb {
 
 struct Fd {
   int fildes;      // file descriptor
+  int hostfd;      // host file descriptor (or -1 if same as fildes)
   int oflags;      // host O_XXX constants
   int socktype;    // host SOCK_XXX constants
   bool norestart;  // is SO_RCVTIMEO in play?
@@ -62,5 +63,8 @@ int CountFds(struct Fds *);
 void FreeFd(struct Fd *);
 void DestroyFds(struct Fds *);
 void InheritFd(struct Fd *);
+static inline int GetHostFd(const struct Fd *fd) {
+  return fd ? (fd->hostfd >= 0 ? fd->hostfd : fd->fildes) : -1;
+}
 
 #endif /* BLINK_FDS_H_ */

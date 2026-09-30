@@ -48,6 +48,7 @@ struct Fd *AddFd(struct Fds *fds, int fildes, int oflags) {
       dll_init(&fd->elem);
       fd->cb = &kFdCbHost;
       fd->fildes = fildes;
+      fd->hostfd = -1;
       fd->oflags = oflags;
       unassert(!pthread_mutex_init(&fd->lock, 0));
       dll_make_first(&fds->list, &fd->elem);
@@ -64,6 +65,7 @@ struct Fd *ForkFd(struct Fds *fds, struct Fd *fd, int fildes, int oflags) {
   if ((fd2 = AddFd(fds, fildes, oflags))) {
     if (fd) {
       fd2->path = fd->path ? strdup(fd->path) : 0;
+      fd2->hostfd = fd->hostfd;
       fd2->socktype = fd->socktype;
       fd2->norestart = fd->norestart;
       memcpy(&fd2->saddr, &fd->saddr, sizeof(fd->saddr));

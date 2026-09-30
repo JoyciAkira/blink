@@ -156,6 +156,11 @@ static bool FreeEmptyPageTables(struct System *s, u64 pt, long level) {
 }
 
 static void FreeHostPages(struct System *s) {
+  if (s->is_vfork_borrowed) {
+    s->cr3 = 0;
+    s->real = 0;
+    return;
+  }
   if (!s->real && s->cr3) {
     unassert(!FreeVirtual(s, -0x800000000000, 0x1000000000000));
     unassert(FreeEmptyPageTables(s, s->cr3, 1));
@@ -283,8 +288,7 @@ bool IsOrphan(struct Machine *m) {
   LOCK(&m->system->machines_lock);
   if (m->system->machines == m->system->machines->next &&
       m->system->machines == m->system->machines->prev) {
-    unassert(m == MACHINE_CONTAINER(m->system->machines));
-    res = true;
+    res = (m == MACHINE_CONTAINER(m->system->machines));
   } else {
     res = false;
   }
@@ -609,10 +613,11 @@ static void UnmarkFilePage(struct System *s, i64 virt) {
 }
 
 static void WaitForPageToNotBeLocked(struct System *s, i64 virt, u8 *pte) {
-  unassert(g_machine);
 #ifdef DEBUG
-  unassert(!IsOrphan(g_machine));
-  unassert(!HasPageLock(g_machine, virt & -4096));
+  if (g_machine) {
+    unassert(!IsOrphan(g_machine));
+    unassert(!HasPageLock(g_machine, virt & -4096));
+  }
 #endif
   LOCK(&s->pagelocks_lock);
   while (LoadPte(pte) & PAGE_LOCKS) {

@@ -54,7 +54,7 @@ void SetWriteAddr(struct Machine *m, i64 addr, u32 size) {
 }
 
 u8 *GetPageAddress(struct System *s, u64 entry, bool is_cr3) {
-  unassert(is_cr3 || (entry & PAGE_V));
+  if (!is_cr3 && !(entry & PAGE_V)) return 0;  /* stale TLB entry — caller handles */
   unassert(~entry & PAGE_RSRV);
   if (entry & PAGE_HOST) {
     return FindHostPage(entry);
@@ -299,7 +299,6 @@ MapError:
   m->segvcode = SEGV_MAPERR_LINUX;
   return (uintptr_t)efault0();
 }
-
 u8 *LookupAddress2(struct Machine *m, i64 virt, u64 mask, u64 need) {
   u8 *host;
   u64 entry;

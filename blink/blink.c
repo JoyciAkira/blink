@@ -41,6 +41,7 @@
 #include "blink/overlays.h"
 #include "blink/pml4t.h"
 #include "blink/signal.h"
+#include "blink/syscall.h"
 #include "blink/sigwinch.h"
 #include "blink/stats.h"
 #include "blink/syscall.h"
@@ -147,9 +148,15 @@ static void PrintDiagnostics(struct Machine *m) {
 }
 
 void TerminateSignal(struct Machine *m, int sig, int code) {
+  VforkDiagLog("[TERMINATE_SIGNAL] sig=%d code=%d tid=%d vfork_child=%p\n", sig, code, m ? m->tid : 0, m ? m->vfork_child : NULL);
   int syssig;
   struct sigaction sa;
   unassert(!IsSignalIgnoredByDefault(sig));
+  if (m && m->vfork_child) {
+    VforkDiagLog("[C5_DIAG] TerminateSignal for virtual child sig=%d code=%d\n", sig, code);
+    VforkNotifyExit(m, 128 + sig);
+    pthread_exit(NULL);
+  }
   KillOtherThreads(m->system);
 #ifdef HAVE_JIT
   DisableJit(&m->system->jit);  // unmapping exec pages is slow
@@ -178,6 +185,7 @@ void TerminateSignal(struct Machine *m, int sig, int code) {
 }
 
 static void OnFatalSystemSignal(int sig, siginfo_t *si, void *ptr) {
+  VforkDiagLog("[ON_FATAL_SYS_SIG] sig=%d addr=%p\n", sig, si ? si->si_addr : NULL);
   struct Machine *m = g_machine;
 #ifdef __APPLE__
   sig = FixXnuSignal(m, sig, si);
@@ -212,6 +220,10 @@ static int Exec(char *execfn, char *prog, char **argv, char **envp) {
   if (FLAG_nojit) DisableJit(&m->system->jit);
 #endif
   m->system->exec = Exec;
+  if (old && old->vfork_child) {
+    m->vfork_child = old->vfork_child;
+    VforkUpdateChildMachine(m);
+  }
   if (!old) {
     // this is the first time a program is being loaded
     LoadProgram(m, execfn, prog, argv, envp, NULL);
@@ -245,6 +257,7 @@ static int Exec(char *execfn, char *prog, char **argv, char **envp) {
     unassert(!pthread_sigmask(SIG_SETMASK, &oldmask, 0));
   }
   Blink(m);
+  return 0;
 }
 
 static void Print(int fd, const char *s) {
@@ -327,10 +340,8 @@ static void HandleSigs(void) {
   signal(SIGPIPE, SIG_IGN);
   sigfillset(&sa.sa_mask);
   sa.sa_flags = 0;
-#ifdef HAVE_THREADS
   sa.sa_handler = OnSigSys;
   unassert(!sigaction(SIGSYS, &sa, 0));
-#endif
   sa.sa_sigaction = OnSignal;
   unassert(!sigaction(SIGINT, &sa, 0));
   unassert(!sigaction(SIGQUIT, &sa, 0));

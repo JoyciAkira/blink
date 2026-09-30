@@ -67,6 +67,8 @@ int SysIoctl(struct Machine *, int, u64, i64);
 _Noreturn void SysExitGroup(struct Machine *, int);
 _Noreturn void SysExit(struct Machine *, int);
 
+bool VforkNotifyExit(struct Machine *, int);
+void VforkUpdateChildMachine(struct Machine *);
 int GetDirFildes(int);
 void AddStdFd(struct Fds *, int);
 int GetOflags(struct Machine *, int);

@@ -65,7 +65,7 @@
 /* -------------------------------------------------------------------------
  * Slab metadata
  * ---------------------------------------------------------------------- */
-#define MAX_SLABS  4096            /* max concurrent slabs = 4096 × 64KB = 256MB backing */
+#define MAX_SLABS  65536           /* max concurrent slabs = 65536 × 64KB = 4GB backing */
 
 typedef struct {
     uint8_t  *base;                /* wasm-page-aligned base, NULL if slot unused */
@@ -78,6 +78,7 @@ typedef struct {
 static SlabMeta g_meta[MAX_SLABS];
 static int      g_meta_count = 0;
 static int      g_partial = -1;         /* head of partial-slab free list (index into g_meta) */
+static int      g_free_slabs = -1;      /* head of completely empty slabs list for reuse */
 
 static volatile int g_mman_lock = 0;
 static inline void mman_lock(void) {
@@ -146,6 +147,25 @@ static void partial_remove(int idx) {
     g_meta[idx].in_partial = 0;
     g_meta[idx].next_partial = -1;
 }
+static uint8_t *slab_get_fresh(int *out_mi) {
+    if (g_free_slabs != -1) {
+        int mi = g_free_slabs;
+        g_free_slabs = g_meta[mi].next_partial;
+        g_meta[mi].next_partial = -1;
+        g_meta[mi].in_partial = 0;
+        *out_mi = mi;
+        return g_meta[mi].base;
+    }
+    uint8_t *base = (uint8_t *)bw_grow(1);
+    if (!base) return NULL;
+    int mi = meta_alloc();
+    if (mi < 0) return NULL;
+    g_meta[mi].base = base;
+    g_meta[mi].next_partial = -1;
+    g_meta[mi].in_partial = 0;
+    *out_mi = mi;
+    return base;
+}
 
 /* -------------------------------------------------------------------------
  * Allocate a single 4KB slot from an existing partial slab or grow new
@@ -165,17 +185,13 @@ static uint8_t *alloc_4k(void) {
         }
         idx = m->next_partial;
     }
-    /* No partial slab available — grow a new wasm page */
-    uint8_t *base = (uint8_t *)bw_grow(1);
+    /* No partial slab available — get a fresh slab (recycled or grown) */
+    int mi;
+    uint8_t *base = slab_get_fresh(&mi);
     if (!base) return NULL;
-    int mi = meta_alloc();
-    if (mi < 0) return NULL;
     SlabMeta *m = &g_meta[mi];
-    m->base       = base;
     m->used       = 0x0001;   /* slot 0 in use */
     m->nslots     = 1;
-    m->in_partial = 0;
-    m->next_partial = -1;
     partial_add(mi);          /* add to partial (15 free slots remain) */
     return base;              /* slot 0 */
 }
@@ -203,17 +219,13 @@ static uint8_t *alloc_nslots_in_slab(int n) {
         }
         idx = m->next_partial;
     }
-    /* Grow a fresh slab */
-    uint8_t *base = (uint8_t *)bw_grow(1);
+    /* Get a fresh slab (recycled or grown) */
+    int mi;
+    uint8_t *base = slab_get_fresh(&mi);
     if (!base) return NULL;
-    int mi = meta_alloc();
-    if (mi < 0) return NULL;
     SlabMeta *m = &g_meta[mi];
-    m->base       = base;
     m->used       = run_mask;  /* first n slots in use */
     m->nslots     = 1;
-    m->in_partial = 0;
-    m->next_partial = -1;
     if (m->used != 0xFFFF) partial_add(mi);
     return base;
 }
@@ -305,6 +317,7 @@ void *mmap(void *addr, size_t length, int prot, int flags, int fd, long offset) 
 
     if (!data) {
         bw_shim_malloc_fail_count++;
+        mman_unlock();
         errno = ENOMEM;
         return MAP_FAILED;
     }
@@ -358,8 +371,9 @@ int munmap(void *addr, size_t length) {
             if (was_full && m->used != 0xFFFF) partial_add(idx);
             if (m->used == 0) {
                 partial_remove(idx);
-                m->base = NULL;  /* slab slot reusable */
-                /* wasm pages can't be returned to OS; just track for reuse */
+                m->next_partial = g_free_slabs;
+                g_free_slabs = idx;
+                m->in_partial = 0;
             }
         }
         /* if not found in meta (e.g. a big-alloc that fits in one wasm page):
