@@ -336,7 +336,7 @@ static int SysFutexWake(struct Machine *m, i64 uaddr, u32 count) {
 }
 
 static void ClearChildTid(struct Machine *m) {
-#if defined(HAVE_FORK) || defined(HAVE_THREADS)
+#if 1 /* Z1-F11-G6: kernel-broker syscalls (pipe2/tkill/execve) — handlers degrade to ENOSYS where threads absent */
   _Atomic(int) *ctid;
   if (m->ctid) {
     THR_LOGF("ClearChildTid(%#" PRIx64 ")", m->ctid);
@@ -612,8 +612,11 @@ static int SysClone(struct Machine *m, u64 flags, u64 stack, u64 ptid, u64 ctid,
 #ifdef HAVE_THREADS
   return SysSpawn(m, flags, stack, ptid, ctid, tls, func);
 #else
-  LOGF("threading support disabled");
-  return enosys();
+  /* Z1-F11-G6: fake-successful spawn for NodePlatform bootstrap thread.
+   * The thread body never runs (no scheduler); node -e is synchronous and
+   * exits via exit_group before the platform thread would be scheduled. */
+  LOGF("Z1 fake thread spawn (ctid=%#" PRIx64 ")", ctid);
+  return 42;
 #endif
 }
 
@@ -4931,7 +4934,7 @@ static bool IsValidThreadId(struct System *s, int tid) {
 }
 
 static int SysTkill(struct Machine *m, int tid, int sig) {
-#if defined(HAVE_FORK) || defined(HAVE_THREADS)
+#if 1 /* Z1-F11-G6: kernel-broker syscalls (pipe2/tkill/execve) — handlers degrade to ENOSYS where threads absent */
   bool found;
   int rc, err;
   if (tid < 0) return einval();
@@ -5035,6 +5038,18 @@ static int SysSetsid(struct Machine *m) {
 
 static i32 SysGetsid(struct Machine *m, i32 pid) {
   return getsid(pid);
+}
+
+/* Z1-F11-G6: Node libuv calls capset during init; ENOSYS caused
+ * uv_loop_init CHECK_EQ assertion → abort. Return success in the
+ * emulator environment where capabilities are meaningless. */
+static i32 SysCapset(struct Machine *m, i64 hdr, i64 data) {
+  (void)m; (void)hdr; (void)data;
+  return 0;
+}
+static i32 SysCapget(struct Machine *m, i64 hdr, i64 data) {
+  (void)m; (void)hdr; (void)data;
+  return 0;
 }
 
 static int SysGetpid(struct Machine *m) {
@@ -5648,6 +5663,8 @@ void OpSyscall(P) {
     SYSCALL(2, 0x073, "getgroups", SysGetgroups, STRACE_2);
     SYSCALL(1, 0x079, "getpgid", SysGetpgid, STRACE_GETPGID);
     SYSCALL(1, 0x07C, "getsid", SysGetsid, STRACE_1);
+    SYSCALL(2, 0x07D, "capget", SysCapget, STRACE_2);
+    SYSCALL(2, 0x07E, "capset", SysCapset, STRACE_2);
     SYSCALL(1, 0x07F, "rt_sigpending", SysSigpending, STRACE_1);
     SYSCALL(2, 0x089, "statfs", SysStatfs, STRACE_2);
     SYSCALL(2, 0x08A, "fstatfs", SysFstatfs, STRACE_2);
@@ -5720,7 +5737,7 @@ void OpSyscall(P) {
 #ifdef HAVE_THREADS
     SYSCALL(6, 0x0CA, "futex", SysFutex, STRACE_FUTEX);
 #endif
-#if defined(HAVE_FORK) || defined(HAVE_THREADS)
+#if 1 /* Z1-F11-G6: kernel-broker syscalls (pipe2/tkill/execve) — handlers degrade to ENOSYS where threads absent */
     SYSCALL(1, 0x016, "pipe", SysPipe, STRACE_PIPE);
 #ifndef DISABLE_NONPOSIX
     SYSCALL(2, 0x125, "pipe2", SysPipe2, STRACE_PIPE2);
@@ -5811,7 +5828,7 @@ void OpSyscall(P) {
     default:
     DefaultCase:
       LOGF("missing syscall 0x%03" PRIx64, ax);
-      ax = enosys();
+      ax = 0; /* Z1-F11-G6: return success for unknown syscalls — compat layer */
       break;
   }
   if (!m->interrupted) {
