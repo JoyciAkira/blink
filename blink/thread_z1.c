@@ -27,20 +27,18 @@ __attribute__((export_name("blink_user_thread_resume")))
 void blink_user_thread_resume(i64 cb_guest) {
   struct Z1ThreadCb *zcb;
   struct Machine *m;
-  if (!cb_guest) {
-    LOGF("Z1 thread resume: null control block");
-    return;
-  }
+  /* Error mailbox: zcb->pad (offset 56) carries a diagnostic code the worker
+   * reads if this export returns early. Blink(m) is _Noreturn — reaching the
+   * end of this function means an early-return path was taken. */
+  if (!cb_guest) return;
   zcb = (struct Z1ThreadCb *)cb_guest;
   if (zcb->magic != 0x5a315448554e4f44ULL) {
-    LOGF("Z1 thread resume: bad control block magic %#" PRIx64, zcb->magic);
+    zcb->pad = 2; /* bad magic */
     return;
   }
   m = (struct Machine *)(cb_guest + zcb->machine_offset);
-  /* Per-instance host state: g_machine is Thread-local, so this worker's
-   * instance gets its own without disturbing any other Machine. m->system
-   * and all heap pointers inside the Machine are shared guest memory. */
   g_machine = m;
-  LOGF("Z1 thread resume: tid=%d entering x86 loop", m->tid);
-  Blink(m); /* _Noreturn — real x86 execution on the child Machine */
+  zcb->pad = 0; /* entered x86 loop */
+  Blink(m);     /* _Noreturn — real x86 execution on the child Machine */
+  zcb->pad = 9; /* Blink returned (must not happen) */
 }
