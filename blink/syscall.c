@@ -18,6 +18,24 @@
 ╚─────────────────────────────────────────────────────────────────────────────*/
 #include "blink/syscall.h"
 
+/* Z1-G6-THREADS: control block shared between the spawning blink instance and
+ * the child worker's blink instance. Lives in the shared guest heap. Layout:
+ * [ struct Z1ThreadCb ][ struct Machine copy ]. The child worker calls the
+ * blink_user_thread_resume export with the block's guest address. */
+struct Z1ThreadCb {
+  u64 magic;          /* 0x5A315448 'Z1TH' */
+  u64 machine_offset; /* sizeof(struct Z1ThreadCb) */
+  u64 system_ptr;     /* struct System * — shared heap, valid in both */
+  u64 clone_entry;    /* guest fn (x86 addr of musl thread trampoline) */
+  u64 args_ptr;       /* guest fn_arg (clone_entry_arg on child stack) */
+  u64 stack_top;      /* child stack top (musl-set) */
+  u64 tls_base;       /* child FS base */
+  int tid;            /* authentic kernel TID */
+  int pad;
+};
+#define Z1_THREAD_CB_MAGIC 0x5a315448554e4f44ULL
+#define Z1_THREAD_MACHINE_OFF sizeof(struct Z1ThreadCb)
+
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -590,7 +608,124 @@ static int SysSpawn(struct Machine *m, u64 flags, u64 stack, u64 ptid, u64 ctid,
   unassert(!pthread_sigmask(SIG_SETMASK, &oldss, 0));
   return tid;
 }
-#endif
+#endif /* HAVE_THREADS */
+
+#if !defined(HAVE_THREADS) && defined(Z1_THREAD_BROKER)
+/* Z1-G6-THREADS: kernel-broker thread spawn. Creates a genuine child x86
+ * Machine and hands it to the M115 worker via a kernel clone-with-fn. The
+ * child worker resumes the serialized Machine through
+ * blink_user_thread_resume (thread_z1.c). No fake TIDs: the kernel returns
+ * the authentic child task pid. */
+struct Z1SpawnCtx {
+  struct Z1ThreadCb cb;
+  /* sizeof(struct Machine) bytes of Machine follow */
+};
+
+static i32 SysSpawnZ1(struct Machine *m, u64 flags, u64 stack, u64 ptid,
+                      u64 ctid, u64 tls, u64 func) {
+  int tid;
+  struct Machine *m2;
+  struct Z1ThreadCb *zcb;
+  long krc;
+  u64 kflags;
+  u64 supported, mandatory, ignored;
+
+  (void)stack;
+  (void)ptid;
+  if ((flags & 255) != 0 && (flags & 255) != SIGCHLD_LINUX) {
+    LOGF("Z1 clone: unsupported exit signal %#" PRIx64, flags & 255);
+    return einval();
+  }
+  supported = CLONE_THREAD_LINUX | CLONE_VM_LINUX | CLONE_FS_LINUX |
+              CLONE_FILES_LINUX | CLONE_SIGHAND_LINUX | CLONE_SETTLS_LINUX |
+              CLONE_PARENT_SETTID_LINUX | CLONE_CHILD_CLEARTID_LINUX |
+              CLONE_CHILD_SETTID_LINUX | CLONE_SYSVSEM_LINUX;
+  mandatory = CLONE_THREAD_LINUX | CLONE_VM_LINUX | CLONE_FS_LINUX |
+              CLONE_FILES_LINUX | CLONE_SIGHAND_LINUX;
+  ignored = CLONE_DETACHED_LINUX | CLONE_IO_LINUX;
+  kflags = (flags & ~255 & ~ignored);
+  if (kflags & ~supported) {
+    LOGF("Z1 clone: unsupported flags %#" PRIx64, kflags & ~supported);
+    return einval();
+  }
+  if ((kflags & mandatory) != mandatory) {
+    LOGF("Z1 clone: missing mandatory thread flags");
+    return einval();
+  }
+
+  if (!(m2 = NewMachine(m->system, m))) {
+    return eagain();
+  }
+  m->threaded = true;
+  m2->threaded = true;
+  tid = m2->tid;
+
+  /* noMMU clone ABI: the child STARTS at the guest trampoline with the
+   * prearranged child stack, instead of returning from the syscall. */
+  m2->ip = func;
+  Put64(m2->sp, stack);
+  Put64(m2->di, stack);
+  Put64(m2->ax, 0);
+  if (tls) {
+    m2->fs.base = tls;
+  }
+  if (ctid) {
+    m2->ctid = ctid;
+  }
+
+  /* Serialize the child Machine into a shared-heap control block. */
+  zcb = (struct Z1ThreadCb *)malloc(sizeof(struct Z1ThreadCb) +
+                                    sizeof(struct Machine));
+  if (!zcb) {
+    FreeMachine(m2);
+    return eagain();
+  }
+  zcb->magic = Z1_THREAD_CB_MAGIC;
+  zcb->machine_offset = Z1_THREAD_MACHINE_OFF;
+  zcb->system_ptr = (u64)(intptr_t)m->system;
+  zcb->clone_entry = func;
+  zcb->args_ptr = stack;
+  zcb->stack_top = stack;
+  zcb->tls_base = tls;
+  zcb->tid = tid;
+  memcpy((char *)zcb + Z1_THREAD_MACHINE_OFF, m2, sizeof(struct Machine));
+
+  /* Kernel clone-with-fn: fn = child x86 entry, fn_arg = cb pointer. The
+   * kernel forwards both to the worker's switch_entry, which hands them to
+   * blink_user_thread_resume on the child worker. CLONE_VM keeps the guest
+   * address space shared: the serialized Machine references (system, heap)
+   * remain valid in the child. */
+  /* fn slot carries the CONTROL BLOCK pointer (not clone_entry): the worker's
+   * switch_entry magic-check routes it to blink_user_thread_resume. The child
+   * Machine's start state (RIP/RDI/RSP/TLS) is already serialized in the cb. */
+  krc = syscall(220 /* __NR_clone (z1 noMMU ABI) */, (uintptr_t)zcb,
+                0, kflags | (flags & 255), 0, 0, 0);
+  if (krc < 0) {
+    free(zcb);
+    FreeMachine(m2);
+    return -1;
+  }
+
+  /* Parent: TIDs already written by NewMachine bookkeeping; honor guest
+   * SETTID contracts against our own records. */
+  if (flags & CLONE_CHILD_SETTID_LINUX) {
+    struct Machine *live = (struct Machine *)((char *)zcb + Z1_THREAD_MACHINE_OFF);
+    i64 ct = live->ctid;
+    if (ct && !(ct & (sizeof(i32) - 1))) {
+      i32 v32 = (i32)tid;
+      CopyToUserWrite(m, ct, &v32, 4);
+    }
+  }
+  if (flags & CLONE_PARENT_SETTID_LINUX) {
+    if (ptid && !(ptid & (sizeof(i32) - 1)) &&
+        IsValidMemory(m, ptid, 4, PROT_READ | PROT_WRITE)) {
+      i32 v32 = (i32)tid;
+      CopyToUserWrite(m, ptid, &v32, 4);
+    }
+  }
+  return (i32)tid;
+}
+#endif /* !HAVE_THREADS && Z1_THREAD_BROKER */
 
 static bool IsForkOrVfork(u64 flags) {
   u64 supported = CLONE_CHILD_SETTID_LINUX | CLONE_CHILD_CLEARTID_LINUX;
@@ -612,11 +747,7 @@ static int SysClone(struct Machine *m, u64 flags, u64 stack, u64 ptid, u64 ctid,
 #ifdef HAVE_THREADS
   return SysSpawn(m, flags, stack, ptid, ctid, tls, func);
 #else
-  /* Z1-F11-G6: fake-successful spawn for NodePlatform bootstrap thread.
-   * The thread body never runs (no scheduler); node -e is synchronous and
-   * exits via exit_group before the platform thread would be scheduled. */
-  LOGF("Z1 fake thread spawn (ctid=%#" PRIx64 ")", ctid);
-  return 42;
+  return SysSpawnZ1(m, flags, stack, ptid, ctid, tls, func);
 #endif
 }
 
