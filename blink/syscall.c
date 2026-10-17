@@ -727,6 +727,30 @@ static i32 SysSpawnZ1(struct Machine *m, u64 flags, u64 stack, u64 ptid,
 }
 #endif /* !HAVE_THREADS && Z1_THREAD_BROKER */
 
+#if !defined(HAVE_THREADS) && defined(Z1_THREAD_BROKER)
+/* Z1-G6-THREADS: guest futex forwarded to the kernel z1_futex (asm-generic 98,
+ * kernel maps __NR_futex -> sys_z1_futex with WAIT/WAKE + lost-wakeup closure).
+ * The V8 platform worker blocks on futexes at bootstrap — without this the
+ * thread child spins on ENOSYS and node never progresses (G6DK1). */
+static i32 SysFutexZ1(struct Machine *m, u64 uaddr, u64 op, u64 val, u64 timeout,
+                      u64 uaddr2, u64 val3) {
+  (void)m;
+  return (i32)syscall(98 /* __NR_futex (asm-generic) = kernel sys_z1_futex */,
+                      uaddr, op, val, timeout, uaddr2, val3);
+}
+#endif
+
+#if !defined(HAVE_THREADS) && defined(Z1_THREAD_BROKER)
+static i32 SysExitZ1(struct Machine *m, u64 code) {
+  /* Thread-only exit: this task's kernel task exits; the process continues. */
+  syscall(93 /* __NR_exit (asm-generic) = kernel sys_exit for this task */,
+          code & 0xffffffff, 0, 0, 0, 0, 0);
+  /* Kernel exit for a non-initial task suspends the continuation and never
+   * returns in the healthy path; if it does return, halt this Machine. */
+  return 0;
+}
+#endif
+
 static bool IsForkOrVfork(u64 flags) {
   u64 supported = CLONE_CHILD_SETTID_LINUX | CLONE_CHILD_CLEARTID_LINUX;
   return (flags & ~supported) == SIGCHLD_LINUX ||
@@ -5865,8 +5889,8 @@ void OpSyscall(P) {
     SYSCALL(4, 0x03D, "wait4", SysWait4, STRACE_WAIT4);
     SYSCALL(2, 0x03E, "kill", SysKill, STRACE_KILL);
 #endif /* HAVE_FORK */
-#ifdef HAVE_THREADS
-    SYSCALL(6, 0x0CA, "futex", SysFutex, STRACE_FUTEX);
+#if defined(HAVE_THREADS) || defined(Z1_THREAD_BROKER)
+    SYSCALL(6, 0x0CA, "futex", SysFutexZ1, STRACE_FUTEX);
 #endif
 #if 1 /* Z1-F11-G6: kernel-broker syscalls (pipe2/tkill/execve) — handlers degrade to ENOSYS where threads absent */
     SYSCALL(1, 0x016, "pipe", SysPipe, STRACE_PIPE);
