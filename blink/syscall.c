@@ -750,6 +750,16 @@ static _Noreturn void SysExitZ1(struct Machine *m, u64 code) {
    * Fail closed if the continuation unexpectedly resumes. */
   __builtin_trap();
 }
+
+/* x86 SYS_exit_group(231) acts on the whole Linux thread group.
+ * Brokered Z1 builds must not use Blink's per-instance host _Exit/KillOtherThreads:
+ * the kernel owns CLONE_THREAD identities and group termination. */
+static _Noreturn void SysExitGroupZ1(struct Machine *m, u64 code) {
+  (void)m;
+  syscall(94 /* __NR_exit_group (asm-generic) */, code & 0xffffffff,
+          0, 0, 0, 0, 0);
+  __builtin_trap(); /* kernel group termination is nonreturning */
+}
 #endif
 
 static bool IsForkOrVfork(u64 flags) {
@@ -5969,7 +5979,11 @@ void OpSyscall(P) {
 #endif
     case 0xE7:
       SYS_LOGF("%s(%#" PRIx64 ")", "exit_group", di);
+#if !defined(HAVE_THREADS) && defined(Z1_THREAD_BROKER)
+      SysExitGroupZ1(m, di);
+#else
       SysExitGroup(m, di);
+#endif
     case 0x00F:
       SigRestore(m);
       m->interrupted = true;  // preevnt ax clobber
