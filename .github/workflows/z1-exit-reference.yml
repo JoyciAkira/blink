@@ -3,12 +3,16 @@ on:
   pull_request:
     paths:
       - 'test/z1/z1-thread-exit-probe.c'
+      - 'test/z1/check-exit-dispatch-contract.py'
+      - 'blink/syscall.c'
       - '.github/workflows/z1-exit-reference.yml'
   push:
     branches:
       - 'review/z1-g6-exit-thread-vs-group-20261018'
     paths:
       - 'test/z1/z1-thread-exit-probe.c'
+      - 'test/z1/check-exit-dispatch-contract.py'
+      - 'blink/syscall.c'
       - '.github/workflows/z1-exit-reference.yml'
   workflow_dispatch:
 
@@ -20,6 +24,8 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@v4
+      - name: Verify Z1 exit dispatch source contract (not a build)
+        run: python3 test/z1/check-exit-dispatch-contract.py
       - name: Build reference guest source
         run: |
           clang -std=c11 -D_GNU_SOURCE -Wall -Wextra -Werror -O2 -pthread \
