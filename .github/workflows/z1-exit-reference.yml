@@ -1,0 +1,46 @@
+name: Z1 G6 guest exit reference (host-only)
+on:
+  pull_request:
+    paths:
+      - 'test/z1/z1-thread-exit-probe.c'
+      - '.github/workflows/z1-exit-reference.yml'
+  push:
+    branches:
+      - 'review/z1-g6-exit-thread-vs-group-20261018'
+    paths:
+      - 'test/z1/z1-thread-exit-probe.c'
+      - '.github/workflows/z1-exit-reference.yml'
+  workflow_dispatch:
+
+jobs:
+  host-reference:
+    name: Linux x86-64 reference — NOT ZERONODE T0
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build reference guest source
+        run: |
+          clang -std=c11 -D_GNU_SOURCE -Wall -Wextra -Werror -O2 -pthread \
+            test/z1/z1-thread-exit-probe.c -o /tmp/z1-thread-exit-probe
+      - name: Verify thread exit preserves parent
+        run: |
+          set -euo pipefail
+          timeout 10s /tmp/z1-thread-exit-probe thread | tee /tmp/z1-thread.out
+          grep -Fx 'Z1_THREAD_EXIT_PARENT_ALIVE' /tmp/z1-thread.out
+      - name: Verify exit_group terminates the process
+        run: |
+          set -euo pipefail
+          set +e
+          timeout 10s /tmp/z1-thread-exit-probe group > /tmp/z1-group.out 2>&1
+          code=$?
+          set -e
+          cat /tmp/z1-group.out
+          test "$code" -eq 37
+          ! grep -q 'Z1_THREAD_EXIT_PARENT_ALIVE' /tmp/z1-group.out
+          ! grep -q 'Z1_GROUP_EXIT_FAILED_PARENT_SURVIVED' /tmp/z1-group.out
+      - name: Explicit certification boundary
+        run: |
+          echo 'PASS is a Linux x86-64 HOST REFERENCE, not a ZERONODE browser/kernel witness.' >> "$GITHUB_STEP_SUMMARY"
+          echo 'No T0/T1/T2/T3/T4/T5/C5 certification is implied.' >> "$GITHUB_STEP_SUMMARY"
