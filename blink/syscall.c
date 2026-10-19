@@ -741,13 +741,24 @@ static i32 SysFutexZ1(struct Machine *m, u64 uaddr, u64 op, u64 val, u64 timeout
 #endif
 
 #if !defined(HAVE_THREADS) && defined(Z1_THREAD_BROKER)
-static i32 SysExitZ1(struct Machine *m, u64 code) {
-  /* Thread-only exit: this task's kernel task exits; the process continues. */
+static _Noreturn void SysExitZ1(struct Machine *m, u64 code) {
+  /* Z1: x86-64 SYS_exit(60) terminates only this kernel task. Do not
+   * accidentally route it through SysExitGroup in threads-off builds. */
   syscall(93 /* __NR_exit (asm-generic) = kernel sys_exit for this task */,
           code & 0xffffffff, 0, 0, 0, 0, 0);
-  /* Kernel exit for a non-initial task suspends the continuation and never
-   * returns in the healthy path; if it does return, halt this Machine. */
-  return 0;
+  /* The kernel's task exit must not return to the guest instruction stream.
+   * Fail closed if the continuation unexpectedly resumes. */
+  __builtin_trap();
+}
+
+/* x86 SYS_exit_group(231) acts on the whole Linux thread group.
+ * Brokered Z1 builds must not use Blink's per-instance host _Exit/KillOtherThreads:
+ * the kernel owns CLONE_THREAD identities and group termination. */
+static _Noreturn void SysExitGroupZ1(struct Machine *m, u64 code) {
+  (void)m;
+  syscall(94 /* __NR_exit_group (asm-generic) */, code & 0xffffffff,
+          0, 0, 0, 0, 0);
+  __builtin_trap(); /* kernel group termination is nonreturning */
 }
 #endif
 
@@ -5959,10 +5970,20 @@ void OpSyscall(P) {
 #endif /* DISABLE_NONPOSIX */
     case 0x3C:
       SYS_LOGF("%s(%#" PRIx64 ")", "exit", di);
+#if !defined(HAVE_THREADS) && defined(Z1_THREAD_BROKER)
+      /* Preserve Linux exit-vs-exit_group semantics for worker-backed
+       * guest threads. TID clearing / wake remains a separate kernel contract. */
+      SysExitZ1(m, di);
+#else
       SysExit(m, di);
+#endif
     case 0xE7:
       SYS_LOGF("%s(%#" PRIx64 ")", "exit_group", di);
+#if !defined(HAVE_THREADS) && defined(Z1_THREAD_BROKER)
+      SysExitGroupZ1(m, di);
+#else
       SysExitGroup(m, di);
+#endif
     case 0x00F:
       SigRestore(m);
       m->interrupted = true;  // preevnt ax clobber
