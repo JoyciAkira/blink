@@ -430,6 +430,10 @@ _Noreturn void SysExit(struct Machine *m, int rc) {
 }
 
 static int Fork(struct Machine *m, u64 flags, u64 stack, u64 ctid) {
+#ifdef __wasm__
+  extern int ForkWasm(struct Machine *, u64, u64, u64);
+  return ForkWasm(m, flags, stack, ctid);
+#else
   int pid, newpid = 0;
   _Atomic(int) *ctid_ptr;
   unassert(!m->path.jb);
@@ -503,6 +507,7 @@ static int Fork(struct Machine *m, u64 flags, u64 stack, u64 ctid) {
     }
   }
   return pid;
+#endif
 }
 
 static int SysFork(struct Machine *m) {
@@ -510,8 +515,11 @@ static int SysFork(struct Machine *m) {
 }
 
 static int SysVfork(struct Machine *m) {
-  // TODO: Parent should be stopped while child is running.
+#ifdef __wasm__
+  return Fork(m, CLONE_VM_LINUX | CLONE_VFORK_LINUX, 0, 0);
+#else
   return SysFork(m);
+#endif
 }
 
 struct SpawnArgs {
@@ -5570,6 +5578,10 @@ static i32 EpollPwait(struct Machine *m, i32 epfd, i64 eventsaddr,
       } else {
         waitfor = GetZeroTime();
       }
+      if (waitfor.tv_sec > 0 || waitfor.tv_nsec > 100000000) {
+        waitfor.tv_sec = 0;
+        waitfor.tv_nsec = 100000000;
+      }
 #if defined(HAVE_EPOLL_PWAIT2) && !defined(MUSL_CROSS_MAKE)
       rc = epoll_pwait2(epfd, events, maxevents, &waitfor, &oldmask);
 #else
@@ -5580,6 +5592,18 @@ static i32 EpollPwait(struct Machine *m, i32 epfd, i64 eventsaddr,
         if (CheckInterrupt(m, false)) {
           break;
         }
+      } else if (rc == 0 && CompareTime(now, deadline) < 0) {
+        siginfo_t chld_info;
+        memset(&chld_info, 0, sizeof(chld_info));
+        if (waitid(P_ALL, 0, &chld_info, WNOHANG | WNOWAIT | WEXITED) == 0 && chld_info.si_pid > 0) {
+          EnqueueSignal(m, SIGCHLD_LINUX);
+          if (CheckInterrupt(m, false)) {
+            rc = -1;
+            errno = EINTR;
+            break;
+          }
+        }
+        continue;
       } else {
         break;
       }

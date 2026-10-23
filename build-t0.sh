@@ -58,6 +58,7 @@ for f in blink/*.c; do
 done
 
 SRC_FILES+=("blink-wasm-mman-impl.c")
+SRC_FILES+=("wasm-fork-stubs.c")
 echo "Total source files: ${#SRC_FILES[@]}"
 
 # Compile in the foreground: set -e stops before linking on the first failure.
@@ -77,6 +78,7 @@ echo "=== Linking blink.wasm (${#OBJECTS[@]} objects) ==="
     -Wl,--entry=_start \
     -Wl,--export=_start \
     -Wl,--export=__indirect_function_table \
+    -Wl,--export=blink_user_fork_resume \
     -Wl,--shared-memory \
     -Wl,--initial-memory=2097152 \
     -Wl,--max-memory=4294967296 \

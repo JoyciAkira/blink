@@ -17,7 +17,7 @@
 // #define DISABLE_ROM
 // #define DISABLE_BMI2
 
-// #define HAVE_FORK
+#define HAVE_FORK
 #define HAVE_SYNC
 #define HAVE_DUP3
 #define HAVE_PIPE2
