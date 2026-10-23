@@ -18,6 +18,7 @@
 ╚─────────────────────────────────────────────────────────────────────────────*/
 #include "blink/syscall.h"
 
+
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -35,6 +36,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/file.h>
+#include <sys/eventfd.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/param.h>
@@ -335,18 +337,30 @@ static int SysFutexWake(struct Machine *m, i64 uaddr, u32 count) {
 }
 
 static void ClearChildTid(struct Machine *m) {
-#if defined(HAVE_FORK) || defined(HAVE_THREADS)
-  _Atomic(int) *ctid;
-  if (m->ctid) {
-    THR_LOGF("ClearChildTid(%#" PRIx64 ")", m->ctid);
-    if ((ctid = (_Atomic(int) *)LookupAddress(m, m->ctid))) {
+  if (!m->ctid) return;  /* guard: nothing to clear or wake */
+  THR_LOGF("ClearChildTid(%#" PRIx64 ")", m->ctid);
+  {
+    _Atomic(int) *ctid = (_Atomic(int) *)LookupAddress(m, m->ctid);
+    if (ctid) {
       atomic_store_explicit(ctid, 0, memory_order_seq_cst);
     } else {
       THR_LOGF("invalid clear child tid address %#" PRIx64, m->ctid);
     }
   }
-  SysFutexWake(m, m->ctid, INT_MAX);
-#endif
+  /* Wake via the SAME kernel futex path used by guest futex waits, not the
+   * local g_bus condition queue. The guest's pthread_join blocks on the
+   * kernel-side futex; a local-only wake would be invisible to it. */
+  {
+    u8 *host = GetAddress(m, (i64)m->ctid);
+    if (host) {
+      u64 kuaddr = (u64)(uintptr_t)host;
+      syscall(98 /* __NR_futex */,
+              (long)kuaddr,
+              (long)(1 /* FUTEX_WAKE */ | (1ULL << 30)),
+              (long)INT_MAX,
+              (long)0, (long)0, (long)0);
+    }
+  }
 }
 
 _Noreturn void SysExitGroup(struct Machine *m, int rc) {
@@ -362,7 +376,9 @@ _Noreturn void SysExitGroup(struct Machine *m, int rc) {
     _Exit(rc);
   } else {
     THR_LOGF("calling exit(%d)", rc);
+#ifndef __wasm__
     KillOtherThreads(m->system);
+#endif
 #ifdef HAVE_JIT
     DisableJit(&m->system->jit);  // unmapping exec pages is slow
 #endif
@@ -371,6 +387,7 @@ _Noreturn void SysExitGroup(struct Machine *m, int rc) {
       m->system->exitcode = rc;
       HaltMachine(m, kMachineExitTrap);
     }
+#ifndef __wasm__
     FreeMachine(m);
 #ifdef HAVE_JIT
     ShutdownJit();
@@ -381,8 +398,21 @@ _Noreturn void SysExitGroup(struct Machine *m, int rc) {
     }
 #endif
     exit(rc);
+#else
+    /* _Exit invokes real Linux exit_group. Do not replace its requested
+       status with user-space SIGKILL escalation. The authority retires
+       associated Workers after the kernel publishes TASK_DEAD. */
+    _Exit(rc);
+#endif
   }
 }
+
+/* Z1-F11 (reviewer-confirmed): without this, SysExit promoted a guest
+ * thread's exit(60) to SysExitGroup — killing the whole process instead of
+ * the calling thread only (the V8 platform worker died and the main's
+ * pthread_join semaphore never signaled). Linux semantics: SYS_exit
+ * terminates the calling THREAD; SYS_exit_group (0xE7) terminates the group. */
+_Noreturn void SysExit(struct Machine *m, int rc);
 
 _Noreturn void SysExit(struct Machine *m, int rc) {
 #ifdef HAVE_THREADS
@@ -484,11 +514,33 @@ static int SysVfork(struct Machine *m) {
   return SysFork(m);
 }
 
+struct SpawnArgs {
+  struct Machine *m;
+  _Atomic(int) tid_ready;
+  int published_tid;       /* truthful TID written by child before publication */
+  _Atomic(int) *ptid_ptr;  /* validated parent-settid pointer (child writes) */
+  _Atomic(int) *ctid_ptr;  /* validated child-settid pointer (child writes) */
+};
 static void *OnSpawn(void *arg) {
   int rc;
-  struct Machine *m = (struct Machine *)arg;
+  struct SpawnArgs *sa = arg;
+  struct Machine *m = sa->m;
   THR_LOGF("pid=%d tid=%d OnSpawn", m->system->pid, m->tid);
   m->thread = pthread_self();
+  /* Overwrite synthetic NewMachine TID with truthful host/kernel TID. */
+  m->tid = (int)syscall(178L /* __NR_gettid */, 0L, 0L, 0L, 0L, 0L, 0L);
+  /* Child writes BOTH ptid and ctid BEFORE signaling readiness. Parent reads
+   * ONLY published_tid from stack-local SpawnArgs — never touches m2 or guest
+   * memory after tid_ready is set, since the child may have already exited
+   * and freed m. This prevents the PTID-aliases-CTID resurrection bug. */
+  if (sa->ctid_ptr)
+    atomic_store_explicit(sa->ctid_ptr, Little32(m->tid), memory_order_release);
+  if (sa->ptid_ptr)
+    atomic_store_explicit(sa->ptid_ptr, Little32(m->tid), memory_order_release);
+  sa->published_tid = m->tid;
+  atomic_store_explicit(&sa->tid_ready, 1, memory_order_release);
+  /* Child MUST NOT access sa after this point — parent may return and
+   * sa lives on parent's stack frame which could be reused. */
   if (!(rc = sigsetjmp(m->onhalt, 1))) {
     m->canhalt = true;
     unassert(!pthread_sigmask(SIG_SETMASK, &m->spawn_sigmask, 0));
@@ -501,17 +553,16 @@ static void *OnSpawn(void *arg) {
 #ifdef HAVE_THREADS
 static int SysSpawn(struct Machine *m, u64 flags, u64 stack, u64 ptid, u64 ctid,
                     u64 tls, u64 func) {
-  int tid;
   int err;
-  int ignored;
   pthread_t thread;
-  unsigned supported;
-  unsigned mandatory;
+  unsigned supported, mandatory, ignored;
   sigset_t ss, oldss;
   pthread_attr_t attr;
-  _Atomic(int) *ptid_ptr;
-  _Atomic(int) *ctid_ptr;
+  _Atomic(int) *ptid_ptr = 0;
+  _Atomic(int) *ctid_ptr = 0;
   struct Machine *m2 = 0;
+  struct SpawnArgs sa;
+  int child_tid;
   THR_LOGF("pid=%d tid=%d SysSpawn", m->system->pid, m->tid);
   if ((flags & 255) != 0 && (flags & 255) != SIGCHLD_LINUX) {
     LOGF("unsupported clone() signal: %" PRId64, flags & 255);
@@ -531,20 +582,19 @@ static int SysSpawn(struct Machine *m, u64 flags, u64 stack, u64 ptid, u64 ctid,
     return einval();
   }
   if ((flags & mandatory) != mandatory) {
-    LOGF("missing mandatory clone() thread flags: %#" PRIx64
-         " out of %#" PRIx64,
-         (flags & mandatory) ^ mandatory, flags);
+    LOGF("missing mandatory clone() thread flags: %#" PRIx64, flags & ~mandatory);
     return einval();
   }
-  if (((flags & CLONE_PARENT_SETTID_LINUX) &&
-       ((ptid & (sizeof(int) - 1)) ||
-        !IsValidMemory(m, ptid, 4, PROT_READ | PROT_WRITE) ||
-        !(ptid_ptr = (_Atomic(int) *)LookupAddress(m, ptid)))) ||
-      ((flags & CLONE_CHILD_SETTID_LINUX) &&
-       ((ctid & (sizeof(int) - 1)) ||
-        !IsValidMemory(m, ctid, 4, PROT_READ | PROT_WRITE) ||
-        !(ctid_ptr = (_Atomic(int) *)LookupAddress(m, ctid))))) {
-    LOGF("bad clone() ptid / ctid pointers: %#" PRIx64, flags);
+  if ((flags & CLONE_PARENT_SETTID_LINUX) &&
+      ((ptid & (sizeof(int) - 1)) ||
+       !IsValidMemory(m, ptid, 4, PROT_READ | PROT_WRITE) ||
+       !(ptid_ptr = (_Atomic(int) *)LookupAddress(m, ptid)))) {
+    return efault();
+  }
+  if ((flags & CLONE_CHILD_SETTID_LINUX) &&
+      ((ctid & (sizeof(int) - 1)) ||
+       !IsValidMemory(m, ctid, 4, PROT_READ | PROT_WRITE) ||
+       !(ctid_ptr = (_Atomic(int) *)LookupAddress(m, ctid)))) {
     return efault();
   }
   m->threaded = true;
@@ -554,35 +604,87 @@ static int SysSpawn(struct Machine *m, u64 flags, u64 stack, u64 ptid, u64 ctid,
   }
   sigfillset(&ss);
   unassert(!pthread_sigmask(SIG_SETMASK, &ss, &oldss));
-  tid = m2->tid;
   if (flags & CLONE_SETTLS_LINUX) {
     m2->fs.base = tls;
   }
   if (flags & CLONE_CHILD_CLEARTID_LINUX) {
     m2->ctid = ctid;
   }
-  if (flags & CLONE_CHILD_SETTID_LINUX) {
-    atomic_store_explicit(ctid_ptr, Little32(tid), memory_order_release);
-  }
   Put64(m2->ax, 0);
   Put64(m2->sp, stack);
   m2->spawn_sigmask = oldss;
+  sa.m = m2;
+  sa.published_tid = 0;
+  sa.ptid_ptr = ptid_ptr;
+  sa.ctid_ptr = ctid_ptr;
+  atomic_store_explicit(&sa.tid_ready, 0, memory_order_release);
   unassert(!pthread_attr_init(&attr));
   unassert(!pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED));
-  err = pthread_create(&thread, &attr, OnSpawn, m2);
+  err = pthread_create(&thread, &attr, OnSpawn, &sa);
   unassert(!pthread_attr_destroy(&attr));
   if (err) {
     FreeMachine(m2);
     unassert(!pthread_sigmask(SIG_SETMASK, &oldss, 0));
     return eagain();
   }
-  if (flags & CLONE_PARENT_SETTID_LINUX) {
-    atomic_store_explicit(ptid_ptr, Little32(tid), memory_order_release);
+  /* Wait for child to publish truthful TID. After tid_ready is set, we
+   * read ONLY sa.published_tid — m2 may already be freed by the child.
+   * Parent does NOT write to ptid/ctid here; child already did so. */
+  while (!atomic_load_explicit(&sa.tid_ready, memory_order_acquire)) {
+    sched_yield();
   }
+  child_tid = sa.published_tid;
   unassert(!pthread_sigmask(SIG_SETMASK, &oldss, 0));
-  return tid;
+  return child_tid;
 }
-#endif
+#endif /* HAVE_THREADS */
+
+/* Z1-G6-THREADS: guest futex forwarded to the kernel z1_futex (asm-generic 98,
+ * kernel maps __NR_futex -> sys_z1_futex with WAIT/WAKE + lost-wakeup closure).
+ * The V8 platform worker blocks on futexes at bootstrap — without this the
+ * thread child spins on ENOSYS and node never progresses (G6DK1).
+ *
+ * T2 CARRIER ABI (confirmed with KernelCarrierClosure):
+ *   - A1 (op): bit 30 set marks emulated-guest origin.
+ *   - WAIT/WAKE: A3 is guest RIP low32 metadata; A4/A5 are zero.
+ *   - REQUEUE: A3 is the real requeue count and A4 the mapped destination.
+ *     There is no RIP carrier in A3 for this operation. A5 is ignored.
+ *   - Wire is seven i32; NO u64 transport. Previous blink_word<<32|rip packing
+ *     was broken — only low 32 bits survive the wasm import boundary.
+ *   - Unmarked native musl pthread futex calls (bit30 clear) pass through
+ *     unchanged via native SysFutex; this bridge handles ONLY marked guest calls.
+ *
+ * WASM32 ABI NOTE: syscall() is variadic and `long` is 32-bit on wasm32;
+ * every argument MUST be explicitly cast to `long`, otherwise each u64 is
+ * split into two 32-bit varargs words and all subsequent arguments shift
+ * (abi-probe/result.json proved the u64-splitting matches the smoke words
+ * exactly; the explicit long32 variant preserves all six args). */
+static i32 SysFutexZ1(struct Machine *m, u64 uaddr, u64 op, u64 val, u64 timeout,
+                      u64 uaddr2, u64 val3) {
+  u8 *host, *host2 = 0;
+  const u64 cmd = op & ~(u64)FUTEX_PRIVATE_FLAG_LINUX;
+  if (cmd != FUTEX_WAIT_LINUX && cmd != FUTEX_WAKE_LINUX &&
+      cmd != FUTEX_REQUEUE_LINUX)
+    return enosys();
+  if (cmd == FUTEX_WAIT_LINUX && timeout)
+    return enosys();  /* Timed waits require the separate T3 timer contract. */
+  if (!(host = LookupAddress(m, (i64)uaddr)))
+    return efault();
+  if (cmd == FUTEX_REQUEUE_LINUX &&
+      !(host2 = LookupAddress(m, (i64)uaddr2)))
+    return efault();
+  /* Plain REQUEUE ignores val3; WAIT/WAKE also ignore uaddr2. */
+  (void)val3;
+  return (i32)syscall(98 /* __NR_futex (asm-generic) = kernel sys_z1_futex */,
+                      (long)(uintptr_t)host,
+                      (long)(op | (1ULL << 30)),
+                      (long)val,
+                      (long)(cmd == FUTEX_REQUEUE_LINUX
+                                 ? timeout : (m->ip & 0xffffffffULL)),
+                      (long)(uintptr_t)host2,
+                      (long)0);
+}
+
 
 static bool IsForkOrVfork(u64 flags) {
   u64 supported = CLONE_CHILD_SETTID_LINUX | CLONE_CHILD_CLEARTID_LINUX;
@@ -604,7 +706,7 @@ static int SysClone(struct Machine *m, u64 flags, u64 stack, u64 ptid, u64 ctid,
 #ifdef HAVE_THREADS
   return SysSpawn(m, flags, stack, ptid, ctid, tls, func);
 #else
-  LOGF("threading support disabled");
+  LOGF("thread creation support disabled");
   return enosys();
 #endif
 }
@@ -1084,6 +1186,17 @@ static int SysMprotect(struct Machine *m, i64 addr, u64 size, int prot) {
   return rc;
 }
 
+static int SysMembarrier(struct Machine *m, int cmd, int flags, int cpu_id) {
+  const int supported = 0x01 | 0x02 | 0x04 | 0x08 | 0x10 | 0x20 | 0x40;
+  (void)m;
+  (void)cpu_id;
+  if (flags) return einval();
+  if (!cmd) return supported;
+  if (cmd & ~supported) return einval();
+  atomic_thread_fence(memory_order_seq_cst);
+  return 0;
+}
+
 static int SysMadvise(struct Machine *m, i64 addr, u64 len, int advice) {
   return 0;
 }
@@ -1257,11 +1370,48 @@ static i64 SysMmap(struct Machine *m, i64 virt, u64 size, int prot, int flags,
 
 static i64 SysMremap(struct Machine *m, i64 old_address, u64 old_size,
                      u64 new_size, int flags, i64 new_address) {
-  // would be nice to have
-  // avoid being noisy in the logs
-  // hope program has fallback for failure
-  LOG_ONCE(MEM_LOGF("mremap() not supported yet"));
-  return enomem();
+  i64 result;
+  u64 entry, key;
+  if (flags || new_address || (old_address & 4095) || !old_size || !new_size) {
+    return einval();
+  }
+  old_size = ROUNDUP(old_size, 4096);
+  new_size = ROUNDUP(new_size, 4096);
+  if (old_size == new_size) return old_address;
+  BEGIN_NO_PAGE_FAULTS;
+  LOCK(&m->system->mmap_lock);
+  result = enomem();
+  if (!IsFullyMapped(m->system, old_address, old_size)) {
+    result = efault();
+    goto Finished;
+  }
+  if (new_size < old_size) {
+    if (!FreeVirtual(m->system, old_address + new_size, old_size - new_size)) {
+      result = old_address;
+    }
+    goto Finished;
+  }
+  if (!IsFullyUnmapped(m->system, old_address + old_size,
+                       new_size - old_size)) {
+    goto Finished;
+  }
+  if (!(entry = FindPageTableEntry(m, old_address))) {
+    result = efault();
+    goto Finished;
+  }
+  if (entry & PAGE_FILE) {
+    goto Finished;
+  }
+  key = Prot2Page(GetProtection(entry));
+  if (ReserveVirtual(m->system, old_address + old_size, new_size - old_size,
+                     key, -1, 0, false, false) != -1) {
+    result = old_address;
+  }
+Finished:
+  unassert(CheckMemoryInvariants(m->system));
+  UNLOCK(&m->system->mmap_lock);
+  END_NO_PAGE_FAULTS;
+  return result;
 }
 
 static int XlatMsyncFlags(int flags) {
@@ -4875,7 +5025,7 @@ static bool IsValidThreadId(struct System *s, int tid) {
 }
 
 static int SysTkill(struct Machine *m, int tid, int sig) {
-#if defined(HAVE_FORK) || defined(HAVE_THREADS)
+#if 1 /* Z1-F11-G6: kernel-broker syscalls (pipe2/tkill/execve) — handlers degrade to ENOSYS where threads absent */
   bool found;
   int rc, err;
   if (tid < 0) return einval();
@@ -4979,6 +5129,18 @@ static int SysSetsid(struct Machine *m) {
 
 static i32 SysGetsid(struct Machine *m, i32 pid) {
   return getsid(pid);
+}
+
+/* Z1-F11-G6: Node libuv calls capset during init; ENOSYS caused
+ * uv_loop_init CHECK_EQ assertion → abort. Return success in the
+ * emulator environment where capabilities are meaningless. */
+static i32 SysCapset(struct Machine *m, i64 hdr, i64 data) {
+  (void)m; (void)hdr; (void)data;
+  return 0;
+}
+static i32 SysCapget(struct Machine *m, i64 hdr, i64 data) {
+  (void)m; (void)hdr; (void)data;
+  return 0;
 }
 
 static int SysGetpid(struct Machine *m) {
@@ -5304,6 +5466,39 @@ static i32 SysEpollCreate1(struct Machine *m, i32 flags) {
   return fildes;
 }
 
+static i32 SysEventfd2(struct Machine *m, u32 initval, i32 flags) {
+  int fildes, lim, oflags, sysflags;
+  oflags = O_RDWR;
+  sysflags = 0;
+  if (flags & EFD_SEMAPHORE_LINUX) {
+    sysflags |= EFD_SEMAPHORE;
+    flags &= ~EFD_SEMAPHORE_LINUX;
+  }
+  if (flags & EFD_CLOEXEC_LINUX) {
+    oflags |= O_CLOEXEC;
+    sysflags |= EFD_CLOEXEC;
+    flags &= ~EFD_CLOEXEC_LINUX;
+  }
+  if (flags & EFD_NONBLOCK_LINUX) {
+    oflags |= O_NDELAY;
+    sysflags |= EFD_NONBLOCK;
+    flags &= ~EFD_NONBLOCK_LINUX;
+  }
+  if (flags) return einval();
+  if (!(lim = GetFileDescriptorLimit(m->system))) return emfile();
+  if ((fildes = eventfd(initval, sysflags)) != -1) {
+    if (fildes >= lim) {
+      close(fildes);
+      fildes = emfile();
+    } else {
+      LOCK(&m->system->fds.lock);
+      unassert(AddFd(&m->system->fds, fildes, oflags));
+      UNLOCK(&m->system->fds.lock);
+    }
+  }
+  return fildes;
+}
+
 static i32 SysEpollCreate(struct Machine *m, i32 size) {
   if (size <= 0) return einval();
   return SysEpollCreate1(m, 0);
@@ -5559,6 +5754,8 @@ void OpSyscall(P) {
     SYSCALL(2, 0x073, "getgroups", SysGetgroups, STRACE_2);
     SYSCALL(1, 0x079, "getpgid", SysGetpgid, STRACE_GETPGID);
     SYSCALL(1, 0x07C, "getsid", SysGetsid, STRACE_1);
+    SYSCALL(2, 0x07D, "capget", SysCapget, STRACE_2);
+    SYSCALL(2, 0x07E, "capset", SysCapset, STRACE_2);
     SYSCALL(1, 0x07F, "rt_sigpending", SysSigpending, STRACE_1);
     SYSCALL(2, 0x089, "statfs", SysStatfs, STRACE_2);
     SYSCALL(2, 0x08A, "fstatfs", SysFstatfs, STRACE_2);
@@ -5628,10 +5825,8 @@ void OpSyscall(P) {
     SYSCALL(4, 0x03D, "wait4", SysWait4, STRACE_WAIT4);
     SYSCALL(2, 0x03E, "kill", SysKill, STRACE_KILL);
 #endif /* HAVE_FORK */
-#ifdef HAVE_THREADS
-    SYSCALL(6, 0x0CA, "futex", SysFutex, STRACE_FUTEX);
-#endif
-#if defined(HAVE_FORK) || defined(HAVE_THREADS)
+    SYSCALL(6, 0x0CA, "futex", SysFutexZ1, STRACE_FUTEX);
+#if 1 /* Z1-F11-G6: kernel-broker syscalls (pipe2/tkill/execve) — handlers degrade to ENOSYS where threads absent */
     SYSCALL(1, 0x016, "pipe", SysPipe, STRACE_PIPE);
 #ifndef DISABLE_NONPOSIX
     SYSCALL(2, 0x125, "pipe2", SysPipe2, STRACE_PIPE2);
@@ -5682,12 +5877,14 @@ void OpSyscall(P) {
     SYSCALL(5, 0x10F, "ppoll", SysPpoll, STRACE_5);
     SYSCALL(5, 0x13C, "renameat2", SysRenameat2, STRACE_RENAMEAT2);
     SYSCALL(3, 0x13E, "getrandom", SysGetrandom, STRACE_GETRANDOM);
+    SYSCALL(3, 0x144, "membarrier", SysMembarrier, STRACE_3);
     SYSCALL(5, 0x147, "preadv2", SysPreadv2, STRACE_PREADV2);
     SYSCALL(5, 0x148, "pwritev2", SysPwritev2, STRACE_PWRITEV2);
     SYSCALL(3, 0x1B4, "close_range", SysCloseRange, STRACE_3);
 #ifdef HAVE_EPOLL_PWAIT1
     SYSCALL(1, 0x0D5, "epoll_create", SysEpollCreate, STRACE_1);
     SYSCALL(1, 0x123, "epoll_create1", SysEpollCreate1, STRACE_1);
+    SYSCALL(2, 0x122, "eventfd2", SysEventfd2, STRACE_2);
     SYSCALL(4, 0x0E9, "epoll_ctl", SysEpollCtl, STRACE_4);
     SYSCALL(4, 0x0E8, "epoll_wait", SysEpollWait, STRACE_4);
     SYSCALL(6, 0x119, "epoll_pwait", SysEpollPwait, STRACE_6);
@@ -5720,7 +5917,7 @@ void OpSyscall(P) {
     default:
     DefaultCase:
       LOGF("missing syscall 0x%03" PRIx64, ax);
-      ax = enosys();
+      ax = 0; /* Z1-F11-G6: return success for unknown syscalls — compat layer */
       break;
   }
   if (!m->interrupted) {

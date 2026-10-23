@@ -2064,6 +2064,18 @@ static const nexgen32e_f kNexgen32e[] = {
     /*209*/ OpSsePsignw,             // #266  (0.000003%)
     /*20A*/ OpSsePsignd,             // #265  (0.000003%)
     /*20B*/ OpSsePmulhrsw,           // #205  (0.000027%)
+    /*20C*/ OpUd,
+    /*20D*/ OpUd,
+    /*20E*/ OpUd,
+    /*20F*/ OpUd,
+    /*210*/ OpUd,
+    /*211*/ OpUd,
+    /*212*/ OpUd,
+    /*213*/ OpUd,
+    /*214*/ OpUd,
+    /*215*/ OpUd,
+    /*216*/ OpUd,
+    /*217*/ OpPtest,
 };
 
 nexgen32e_f GetOp(long op) {
@@ -2252,7 +2264,11 @@ void Actor(struct Machine *mm) {
 void Blink(struct Machine *m) {
   int rc;
   for (;;) {
+#ifdef __wasm__
+    if (!(rc = setjmp(m->onhalt))) {
+#else
     if (!(rc = sigsetjmp(m->onhalt, 1))) {
+#endif
       m->canhalt = true;
       Actor(m);
     }

@@ -44,7 +44,9 @@
  *   ELF LOAD segments (offset always 4KB-aligned), so mugsize=4096 always.
  *   We read the fd content into the slot exactly as before.
  *
- *   Thread safety: blink DISABLE_THREADS — single-threaded, no locks needed.
+ *   Thread safety: HAVE_THREADS enabled — all mmap/munmap operations are
+ *   serialized by g_mman_lock to prevent data races on g_meta/g_partial/
+ *   g_big_free when musl pthread_create allocates stacks concurrently.
  */
 
 #include <errno.h>
@@ -54,6 +56,7 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <unistd.h>
+#include <pthread.h>
 
 /* -------------------------------------------------------------------------
  * Constants
@@ -90,6 +93,7 @@ typedef struct BigFree {
 } BigFree;
 
 static BigFree *g_big_free = NULL; /* simple LIFO — size is rarely reused exactly */
+static pthread_mutex_t g_mman_lock = PTHREAD_MUTEX_INITIALIZER;
 
 /* -------------------------------------------------------------------------
  * wasm memory.grow helpers
@@ -218,9 +222,7 @@ static uint8_t *alloc_big(size_t nwasm_pages) {
     while (cur) {
         if (cur->nwasm_pages == nwasm_pages) {
             *prev = cur->next;
-            uint8_t *p = cur->base;
-            free(cur);
-            return p;
+            return cur->base;
         }
         prev = &cur->next;
         cur  = cur->next;
@@ -256,15 +258,14 @@ void bw_dump_shim_stats(void) {
  * mmap
  * ---------------------------------------------------------------------- */
 void *mmap(void *addr, size_t length, int prot, int flags, int fd, long offset) {
+    void *data;
+    pthread_mutex_lock(&g_mman_lock);
     (void)addr; (void)prot; (void)flags;
-
     if (length == 0) length = 1;
-
     bw_shim_mmap_count++;
     bw_shim_requested_bytes += (unsigned long long)length;
     if ((unsigned long long)length > bw_shim_largest_request)
         bw_shim_largest_request = (unsigned long long)length;
-
     if ((bw_shim_mmap_count % 512) == 0) {
         char p[200];
         int pn = snprintf(p, sizeof(p),
@@ -275,11 +276,8 @@ void *mmap(void *addr, size_t length, int prot, int flags, int fd, long offset) 
             bw_shim_malloc_fail_count);
         if (pn > 0) { ssize_t w = write(2, p, (size_t)pn); (void)w; }
     }
-
-    void *data;
     size_t rounded = (length + SLOT_SIZE - 1) & ~(size_t)(SLOT_SIZE - 1);
-    int    nslots  = (int)(rounded / SLOT_SIZE);  /* 1..N */
-
+    int    nslots  = (int)(rounded / SLOT_SIZE);
     if (nslots == 1) {
         data = alloc_4k();
         bw_shim_allocated_bytes += SLOT_SIZE;
@@ -291,17 +289,13 @@ void *mmap(void *addr, size_t length, int prot, int flags, int fd, long offset) 
         data = alloc_big(npages);
         bw_shim_allocated_bytes += npages * WASM_PAGE;
     }
-
     if (!data) {
         bw_shim_malloc_fail_count++;
         errno = ENOMEM;
+        pthread_mutex_unlock(&g_mman_lock);
         return MAP_FAILED;
     }
-
-    /* wasm zero-inits fresh pages; zero reused slots for correctness */
     memset(data, 0, rounded);
-
-    /* File-backed: read fd content into slot */
     if (fd >= 0 && length > 0) {
         off_t saved = lseek(fd, 0, SEEK_CUR);
         if (saved != (off_t)-1) {
@@ -320,7 +314,7 @@ void *mmap(void *addr, size_t length, int prot, int flags, int fd, long offset) 
             (void)lseek(fd, saved, SEEK_SET);
         }
     }
-
+    pthread_mutex_unlock(&g_mman_lock);
     return data;
 }
 
@@ -329,13 +323,12 @@ void *mmap(void *addr, size_t length, int prot, int flags, int fd, long offset) 
  * ---------------------------------------------------------------------- */
 int munmap(void *addr, size_t length) {
     if (!addr || addr == MAP_FAILED) return 0;
-
+    pthread_mutex_lock(&g_mman_lock);
     uint8_t *ptr     = (uint8_t *)addr;
     uint8_t *slab_base = (uint8_t *)((uintptr_t)ptr & ~(uintptr_t)(WASM_PAGE - 1));
     int       slot0    = (int)((ptr - slab_base) / SLOT_SIZE);
     size_t    rounded  = (length + SLOT_SIZE - 1) & ~(size_t)(SLOT_SIZE - 1);
     int       nslots   = (int)(rounded / SLOT_SIZE);
-
     if (nslots <= (int)SLOTS_PER_SLAB) {
         int idx = meta_find_by_base(slab_base);
         if (idx >= 0) {
@@ -346,25 +339,21 @@ int munmap(void *addr, size_t length) {
             if (was_full && m->used != 0xFFFF) partial_add(idx);
             if (m->used == 0) {
                 partial_remove(idx);
-                m->base = NULL;  /* slab slot reusable */
-                /* wasm pages can't be returned to OS; just track for reuse */
+                m->base = NULL;
             }
         }
-        /* if not found in meta (e.g. a big-alloc that fits in one wasm page):
-           fall through and treat as big-free below */
     }
-
     if (nslots > (int)SLOTS_PER_SLAB) {
         size_t npages = (rounded + WASM_PAGE - 1) / WASM_PAGE;
-        BigFree *bf = (BigFree *)malloc(sizeof(BigFree));
-        if (bf) {
-            bf->base        = slab_base;
-            bf->nwasm_pages = npages;
-            bf->next        = g_big_free;
-            g_big_free      = bf;
-        }
+        /* Keep free-list metadata in the released block: malloc here could
+         * re-enter mmap while g_mman_lock is held. */
+        BigFree *bf = (BigFree *)slab_base;
+        bf->base        = slab_base;
+        bf->nwasm_pages = npages;
+        bf->next        = g_big_free;
+        g_big_free      = bf;
     }
-
+    pthread_mutex_unlock(&g_mman_lock);
     return 0;
 }
 
