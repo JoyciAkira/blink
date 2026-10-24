@@ -5588,11 +5588,12 @@ static i32 EpollPwait(struct Machine *m, i32 epfd, i64 eventsaddr,
       rc = epoll_pwait(epfd, events, maxevents,
                        ConvertTimeToInt(ToMilliseconds(waitfor)), &oldmask);
 #endif
+      now = GetTime();
       if (rc == -1 && errno == EINTR) {
         if (CheckInterrupt(m, false)) {
           break;
         }
-      } else if (rc == 0 && CompareTime(now, deadline) < 0) {
+      } else if (rc == 0) {
         siginfo_t chld_info;
         memset(&chld_info, 0, sizeof(chld_info));
         if (waitid(P_ALL, 0, &chld_info, WNOHANG | WNOWAIT | WEXITED) == 0 && chld_info.si_pid > 0) {
@@ -5603,7 +5604,10 @@ static i32 EpollPwait(struct Machine *m, i32 epfd, i64 eventsaddr,
             break;
           }
         }
-        continue;
+        if (CompareTime(now, deadline) < 0) {
+          continue;
+        }
+        break;
       } else {
         break;
       }
