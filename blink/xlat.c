@@ -532,9 +532,15 @@ int XlatSocketFamily(int x) {
     XLAT(AF_UNIX_LINUX, AF_UNIX);
     XLAT(AF_INET_LINUX, AF_INET);
     XLAT(AF_INET6_LINUX, AF_INET6);
+#ifdef AF_NETLINK
+    XLAT(AF_NETLINK_LINUX, AF_NETLINK);
+#endif
+#ifdef AF_PACKET
+    XLAT(AF_PACKET_LINUX, AF_PACKET);
+#endif
     default:
       LOGF("%s %d not supported yet", "socket family", x);
-      errno = ENOPROTOOPT;
+      errno = EAFNOSUPPORT;
       return -1;
   }
 }
@@ -544,6 +550,12 @@ int UnXlatSocketFamily(int x) {
   if (x == AF_UNIX) return AF_UNIX_LINUX;
   if (x == AF_INET) return AF_INET_LINUX;
   if (x == AF_INET6) return AF_INET6_LINUX;
+#ifdef AF_NETLINK
+  if (x == AF_NETLINK) return AF_NETLINK_LINUX;
+#endif
+#ifdef AF_PACKET
+  if (x == AF_PACKET) return AF_PACKET_LINUX;
+#endif
   LOGF("don't know how to translate %s %d", "socket family", x);
   return x;
 }
@@ -1075,6 +1087,28 @@ int XlatSockaddrToHost(struct sockaddr_storage *dst,
       memcpy(&dst_in->sin6_addr, src_in->addr, 16);
       return sizeof(struct sockaddr_in6);
     }
+#ifdef AF_NETLINK
+    case AF_NETLINK_LINUX: {
+      struct sockaddr_nl {
+        unsigned short nl_family;
+        unsigned short nl_pad;
+        uint32_t nl_pid;
+        uint32_t nl_groups;
+      } *dst_nl;
+      const struct sockaddr_nl_linux *src_nl;
+      if (srclen < sizeof(struct sockaddr_nl_linux)) {
+        LOGF("sockaddr size too small for %s", "sockaddr_nl_linux");
+        return einval();
+      }
+      dst_nl = (struct sockaddr_nl *)dst;
+      src_nl = (const struct sockaddr_nl_linux *)src;
+      memset(dst_nl, 0, sizeof(*dst_nl));
+      dst_nl->nl_family = AF_NETLINK;
+      dst_nl->nl_pid = Read32(src_nl->nl_pid);
+      dst_nl->nl_groups = Read32(src_nl->nl_groups);
+      return sizeof(struct sockaddr_nl);
+    }
+#endif
     default:
       LOGF("%s %d not supported yet", "socket family", Read16(src->family));
       errno = EAFNOSUPPORT;
@@ -1138,6 +1172,26 @@ int XlatSockaddrToLinux(struct sockaddr_storage_linux *dst,
     dst_in->port = src_in->sin6_port;
     memcpy(dst_in->addr, &src_in->sin6_addr, 16);
     return sizeof(struct sockaddr_in6_linux);
+#ifdef AF_NETLINK
+  } else if (src->sa_family == AF_NETLINK) {
+    struct sockaddr_nl {
+      unsigned short nl_family;
+      unsigned short nl_pad;
+      uint32_t nl_pid;
+      uint32_t nl_groups;
+    };
+    const struct sockaddr_nl *src_nl = (const struct sockaddr_nl *)src;
+    struct sockaddr_nl_linux *dst_nl = (struct sockaddr_nl_linux *)dst;
+    if (srclen < sizeof(struct sockaddr_nl)) {
+      LOGF("sockaddr size %d too small for %s", (int)srclen, "sockaddr_nl");
+      return einval();
+    }
+    memset(dst_nl, 0, sizeof(*dst_nl));
+    Write16(dst_nl->family, AF_NETLINK_LINUX);
+    Write32(dst_nl->nl_pid, src_nl->nl_pid);
+    Write32(dst_nl->nl_groups, src_nl->nl_groups);
+    return sizeof(struct sockaddr_nl_linux);
+#endif
   } else {
     LOGF("%s %d not supported yet", "socket family", src->sa_family);
     errno = EAFNOSUPPORT;

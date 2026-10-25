@@ -197,6 +197,58 @@ static int IoctlSiocgifaddr(struct Machine *m, int systemfd, i64 ifreq_addr,
   CopyToUserWrite(m, ifreq_addr, &ifreq_linux, sizeof(ifreq_linux));
   return 0;
 }
+static int IoctlSiocsifaddr(struct Machine *m, int systemfd, i64 ifreq_addr,
+                            unsigned long kind) {
+  struct ifreq ifreq;
+  struct ifreq_linux ifreq_linux;
+  if (!IsValidMemory(m, ifreq_addr, sizeof(ifreq_linux), PROT_READ)) {
+    return efault();
+  }
+  CopyFromUserRead(m, &ifreq_linux, ifreq_addr, sizeof(ifreq_linux));
+  memset(&ifreq, 0, sizeof(ifreq));
+  memcpy(ifreq.ifr_name, ifreq_linux.name,
+         MIN(sizeof(ifreq_linux.name) - 1, sizeof(ifreq.ifr_name)));
+  if (Read16(ifreq_linux.addr.family) != AF_INET_LINUX) {
+    LOGF("IoctlSiocsifaddr family mismatch: %d", (int)Read16(ifreq_linux.addr.family));
+    return einval();
+  }
+  int xlat = XlatSockaddrToHost((struct sockaddr_storage *)&ifreq.ifr_addr,
+                                (const struct sockaddr_linux *)&ifreq_linux.addr,
+                                sizeof(struct sockaddr_in_linux));
+  if (xlat != sizeof(struct sockaddr_in)) {
+    LOGF("IoctlSiocsifaddr xlat mismatch: %d vs %zu", xlat, sizeof(struct sockaddr_in));
+    return einval();
+  }
+  int vfs = VfsIoctl(systemfd, kind, &ifreq);
+  if (vfs) {
+    LOGF("IoctlSiocsifaddr VfsIoctl failed: %d errno=%d", vfs, errno);
+    return -1;
+  }
+  return 0;
+}
+
+static int IoctlSiocflags(struct Machine *m, int systemfd, i64 ifreq_addr,
+                          unsigned long kind) {
+  struct ifreq ifreq;
+  struct ifreq_linux ifreq_linux;
+  if (!IsValidMemory(m, ifreq_addr, sizeof(ifreq_linux),
+                     kind == SIOCSIFFLAGS ? PROT_READ : (PROT_READ | PROT_WRITE))) {
+    return efault();
+  }
+  CopyFromUserRead(m, &ifreq_linux, ifreq_addr, sizeof(ifreq_linux));
+  memset(&ifreq, 0, sizeof(ifreq));
+  memcpy(ifreq.ifr_name, ifreq_linux.name,
+         MIN(sizeof(ifreq_linux.name) - 1, sizeof(ifreq.ifr_name)));
+  if (kind == SIOCSIFFLAGS) {
+    ifreq.ifr_flags = (short)Read16(ifreq_linux.flags);
+  }
+  if (VfsIoctl(systemfd, kind, &ifreq)) return -1;
+  if (kind == SIOCGIFFLAGS) {
+    Write16(ifreq_linux.flags, (u16)ifreq.ifr_flags);
+    CopyToUserWrite(m, ifreq_addr, &ifreq_linux, sizeof(ifreq_linux));
+  }
+  return 0;
+}
 
 #endif /* HAVE_SIOCGIFCONF */
 
@@ -399,6 +451,16 @@ int SysIoctl(struct Machine *m, int fildes, u64 request, i64 addr) {
       return IoctlSiocgifaddr(m, fildes, addr, SIOCGIFBRDADDR);
     case SIOCGIFDSTADDR_LINUX:
       return IoctlSiocgifaddr(m, fildes, addr, SIOCGIFDSTADDR);
+    case SIOCSIFADDR_LINUX:
+      return IoctlSiocsifaddr(m, fildes, addr, SIOCSIFADDR);
+    case SIOCSIFNETMASK_LINUX:
+      return IoctlSiocsifaddr(m, fildes, addr, SIOCSIFNETMASK);
+    case SIOCSIFBRDADDR_LINUX:
+      return IoctlSiocsifaddr(m, fildes, addr, SIOCSIFBRDADDR);
+    case SIOCGIFFLAGS_LINUX:
+      return IoctlSiocflags(m, fildes, addr, SIOCGIFFLAGS);
+    case SIOCSIFFLAGS_LINUX:
+      return IoctlSiocflags(m, fildes, addr, SIOCSIFFLAGS);
 #endif /* DISABLE_NONPOSIX */
 #endif /* DISABLE_SOCKETS */
 #endif /* HAVE_SIOCGIFCONF */

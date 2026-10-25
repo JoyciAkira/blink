@@ -47,7 +47,7 @@
 // #define HAVE_GETENTROPY
 // #define HAVE_MAP_SHARED
 // #define HAVE_SENDTO_ZERO
-// #define HAVE_SIOCGIFCONF
+#define HAVE_SIOCGIFCONF
 // #define HAVE_F_GETOWN_EX
 // #define HAVE_DEV_URANDOM
 // #define HAVE_SCHED_YIELD

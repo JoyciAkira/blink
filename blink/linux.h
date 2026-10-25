@@ -334,6 +334,12 @@
 #define SIOCGIFNETMASK_LINUX 0x891b
 #define SIOCGIFBRDADDR_LINUX 0x8919
 #define SIOCGIFDSTADDR_LINUX 0x8917
+#define SIOCGIFFLAGS_LINUX   0x8913
+#define SIOCSIFFLAGS_LINUX   0x8914
+#define SIOCSIFADDR_LINUX    0x8916
+#define SIOCSIFDSTADDR_LINUX 0x8918
+#define SIOCSIFBRDADDR_LINUX 0x891a
+#define SIOCSIFNETMASK_LINUX 0x891c
 
 #define FIOSETOWN_LINUX    0x8901  // int *
 #define SIOCSPGRP_LINUX    0x8902  // int *
@@ -966,6 +972,13 @@ struct sockaddr_in6_linux {
   u8 flowinfo[4];
   u8 addr[16];
   u8 scope_id[4];
+};
+
+struct sockaddr_nl_linux {
+  u8 family[2];
+  u8 pad[2];
+  u8 nl_pid[4];
+  u8 nl_groups[4];
 };
 
 struct sockaddr_storage_linux {

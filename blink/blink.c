@@ -149,6 +149,24 @@ static void PrintDiagnostics(struct Machine *m) {
 void TerminateSignal(struct Machine *m, int sig, int code) {
   int syssig;
   struct sigaction sa;
+  char sigbuf[256];
+  u8 b[16] = {0};
+  for (int i = 0; i < 16; ++i) {
+    u8 *p = (u8 *)LookupAddress(m, m->ip + i);
+    if (p) b[i] = *p;
+  }
+  int sign = snprintf(sigbuf, sizeof(sigbuf),
+    "\n[FATAL_SIGNAL] sig=%d code=%d rip=0x%llx faultaddr=0x%llx rax=0x%llx rdi=0x%llx rsp=0x%llx op=%02x %02x %02x %02x %02x %02x %02x %02x\n",
+    sig, code, (unsigned long long)m->ip, (unsigned long long)m->faultaddr,
+    (unsigned long long)Get64(m->ax), (unsigned long long)Get64(m->di), (unsigned long long)Get64(m->sp),
+    b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]);
+  write(2, sigbuf, sign);
+  const char *bt = GetBacktrace(m);
+  if (bt) {
+    write(2, "\n[GUEST_BACKTRACE]\n", 19);
+    write(2, bt, strlen(bt));
+    write(2, "\n", 1);
+  }
   unassert(!IsSignalIgnoredByDefault(sig));
   KillOtherThreads(m->system);
 #ifdef HAVE_JIT
