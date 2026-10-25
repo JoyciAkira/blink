@@ -43,6 +43,7 @@ struct SignalFrame {
   struct fpstate_linux fp;
 };
 
+
 bool IsSignalIgnoredByDefault(int sig) {
   return sig == SIGURG_LINUX ||   //
          sig == SIGCONT_LINUX ||  //
@@ -75,8 +76,9 @@ void DeliverSignal(struct Machine *m, int sig, int code) {
       sig == SIGBUS_LINUX ||   //
       sig == SIGTRAP_LINUX) {
     Write64(sf.si.addr, m->faultaddr);
-    SYS_LOGF("delivering %s {.si_code = %d, .si_addr = %#" PRIx64 "}",
-             DescribeSignal(sig), code, m->faultaddr);
+    SYS_LOGF("delivering %s {.si_code = %d, .si_addr = %#" PRIx64
+             ", .rip = %#" PRIx64 "}",
+             DescribeSignal(sig), code, m->faultaddr, m->ip);
   } else {
     SYS_LOGF("delivering %s, {.si_code = %d}", DescribeSignal(sig), code);
     if (sig == SIGTRAP_LINUX) {

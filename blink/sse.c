@@ -22,6 +22,7 @@
 
 #include "blink/case.h"
 #include "blink/endian.h"
+#include "blink/flags.h"
 #include "blink/intrin.h"
 #include "blink/likely.h"
 #include "blink/machine.h"
@@ -1568,3 +1569,24 @@ void OpSsePmulhrsw(P) { OpSse(A, MmxPmulhrsw, SsePmulhrsw); }
 void OpSsePabsw(P) { OpSse(A, MmxPabsw, SsePabsw); }
 void OpSsePabsd(P) { OpSse(A, MmxPabsd, SsePabsd); }
 void OpSsePmulld(P) { OpSse(A, MmxPmulld, SsePmulld); }
+
+void OpPtest(P) {
+  const u8 *destination, *source;
+  bool cf, zf;
+  int i;
+  if (!Osz(rde)) OpUdImpl(m);
+  destination = XmmRexrReg(m, rde);
+  source = GetModrmRegisterXmmPointerRead16(A);
+  cf = true;
+  zf = true;
+  for (i = 0; i < 16; ++i) {
+    if (destination[i] & source[i]) zf = false;
+    if ((u8)~destination[i] & source[i]) cf = false;
+  }
+  m->flags = SetFlag(m->flags, FLAGS_ZF, zf);
+  m->flags = SetFlag(m->flags, FLAGS_CF, cf);
+  m->flags = SetFlag(m->flags, FLAGS_PF, false);
+  m->flags = SetFlag(m->flags, FLAGS_AF, false);
+  m->flags = SetFlag(m->flags, FLAGS_SF, false);
+  m->flags = SetFlag(m->flags, FLAGS_OF, false);
+}

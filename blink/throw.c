@@ -115,7 +115,11 @@ void HaltMachine(struct Machine *m, int code) {
       }
   }
   unassert(m->canhalt);
+#ifdef __wasm__
+  longjmp(m->onhalt, code);
+#else
   siglongjmp(m->onhalt, code);
+#endif
 }
 
 void RaiseDivideError(struct Machine *m) {

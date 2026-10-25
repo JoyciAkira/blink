@@ -231,6 +231,7 @@
 
 #define FUTEX_WAIT_LINUX           0
 #define FUTEX_WAKE_LINUX           1
+#define FUTEX_REQUEUE_LINUX        3
 #define FUTEX_WAIT_BITSET_LINUX    9
 #define FUTEX_PRIVATE_FLAG_LINUX   128
 #define FUTEX_CLOCK_REALTIME_LINUX 256
@@ -333,6 +334,12 @@
 #define SIOCGIFNETMASK_LINUX 0x891b
 #define SIOCGIFBRDADDR_LINUX 0x8919
 #define SIOCGIFDSTADDR_LINUX 0x8917
+#define SIOCGIFFLAGS_LINUX   0x8913
+#define SIOCSIFFLAGS_LINUX   0x8914
+#define SIOCSIFADDR_LINUX    0x8916
+#define SIOCSIFDSTADDR_LINUX 0x8918
+#define SIOCSIFBRDADDR_LINUX 0x891a
+#define SIOCSIFNETMASK_LINUX 0x891c
 
 #define FIOSETOWN_LINUX    0x8901  // int *
 #define SIOCSPGRP_LINUX    0x8902  // int *
@@ -838,6 +845,10 @@
 
 #define EPOLL_CLOEXEC_LINUX O_CLOEXEC_LINUX
 
+#define EFD_SEMAPHORE_LINUX 1
+#define EFD_CLOEXEC_LINUX   O_CLOEXEC_LINUX
+#define EFD_NONBLOCK_LINUX  O_NDELAY_LINUX
+
 #define EPOLL_CTL_ADD_LINUX 1
 #define EPOLL_CTL_DEL_LINUX 2
 #define EPOLL_CTL_MOD_LINUX 3
@@ -961,6 +972,13 @@ struct sockaddr_in6_linux {
   u8 flowinfo[4];
   u8 addr[16];
   u8 scope_id[4];
+};
+
+struct sockaddr_nl_linux {
+  u8 family[2];
+  u8 pad[2];
+  u8 nl_pid[4];
+  u8 nl_groups[4];
 };
 
 struct sockaddr_storage_linux {

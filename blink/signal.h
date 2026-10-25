@@ -1,5 +1,6 @@
 #ifndef BLINK_SIGNAL_H_
 #define BLINK_SIGNAL_H_
+
 #include "blink/machine.h"
 
 bool IsSignalSerious(int);
